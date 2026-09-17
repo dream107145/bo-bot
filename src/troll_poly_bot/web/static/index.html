@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>troll-poly-bot · live console</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="alternate icon" href="/static/favicon.png">
+<link rel="apple-touch-icon" href="/static/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div class="brand-text">
+      <h1>Live console</h1>
+      <p>Polymarket 5m crypto up/down · real books, simulated fills</p>
+    </div>
+  </div>
+
+  <div class="controls" role="group" aria-label="Bot controls">
+    <span class="badge" id="bot-badge" data-state="stopped">
+      <span class="dot" aria-hidden="true"></span><span id="bot-state">stopped</span>
+    </span>
+    <label class="ctl-field">
+      <span>Balance</span>
+      <input id="bot-balance" type="number" min="10" max="100000" step="10" value="100">
+    </label>
+    <label class="ctl-field ctl-wide">
+      <span>Assets</span>
+      <input id="bot-assets" type="text" value="" placeholder="all listed" spellcheck="false">
+    </label>
+    <button id="btn-start"   class="btn btn-primary" type="button">Start</button>
+    <button id="btn-stop"    class="btn" type="button">Stop</button>
+    <button id="btn-restart" class="btn" type="button">Restart</button>
+    <button id="theme-toggle" class="btn btn-ghost" type="button" aria-label="Switch theme">
+      <span data-theme-label>Theme</span>
+    </button>
+  </div>
+</header>
+
+<main class="content">
+
+  <div id="notice" class="error-box" hidden role="alert"></div>
+
+  <div id="idle" class="empty-state">
+    <h2>Bot is not running</h2>
+    <p>
+      Press <strong>Start</strong>. It connects to the live Polymarket book feed
+      and Binance prices, then waits ~60 seconds before it can strike a market —
+      it refuses to take a strike until the full 60-second TWAP window is backed
+      by real observations.
+    </p>
+    <p class="empty-hint">Fills are simulated. This repo contains no order-signing code.</p>
+  </div>
+
+  <div id="live" hidden>
+
+    <!-- headline -->
+    <section class="hero-band" aria-label="Account">
+      <div class="hero">
+        <p class="hero-label">Equity</p>
+        <p class="hero-figure" id="hero-equity">—</p>
+        <p class="hero-sub" id="hero-sub"></p>
+      </div>
+      <div class="kpi-row" id="kpi-row"></div>
+    </section>
+
+    <!-- market charts -->
+    <section class="card card-wide" id="market-card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Market</p>
+          <h3>One window, three views</h3>
+          <p class="card-sub" id="chart-sub">Where the price sits against the strike, what the market charges for each side, and the raw price path.</p>
+        </div>
+        <label class="switch" title="Draw the strike distance on the token chart as the Up probability it implies, instead of in its own panel">
+          <input type="checkbox" id="overlay-toggle">
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="switch-label">Overlay strike distance on token chart</span>
+        </label>
+      </div>
+      <div class="chips" id="market-picker"></div>
+      <div class="chart-grid">
+        <div class="price-col" id="strike-panel">
+          <div class="price-col-head">
+            <h4>Distance from strike</h4>
+            <div class="legend" id="strike-legend"></div>
+          </div>
+          <div class="chart-host" id="strike-chart"></div>
+        </div>
+        <div class="price-col" id="price-panel">
+          <div class="price-col-head">
+            <h4 id="price-panel-title">Token price</h4>
+            <div class="legend" id="price-legend"></div>
+          </div>
+          <div class="chart-host" id="price-chart"></div>
+        </div>
+        <div class="price-col price-col-wide">
+          <div class="price-col-head">
+            <h4>Crypto price</h4>
+            <div class="legend" id="spot-legend"></div>
+          </div>
+          <div class="chart-host chart-host-mid" id="spot-chart"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- open markets: the decision table, full width -->
+    <section class="card card-wide">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Now</p>
+          <h3>Open markets</h3>
+          <p class="card-sub" id="markets-sub">Every listed asset, with the engine decision on each window.</p>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table" id="markets-table"></table>
+      </div>
+    </section>
+
+    <div class="grid-2">
+      <!-- model vs market -->
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Calibration</p>
+            <h3>Model vs market</h3>
+            <p class="card-sub">Our fair value against the book's own mid.</p>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table" id="agreement-table"></table>
+        </div>
+        <p class="card-foot" id="agreement-note"></p>
+      </section>
+
+      <!-- why it is not trading -->
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Discipline</p>
+            <h3>Why it is not trading</h3>
+            <p class="card-sub">Which rule is stopping a trade. Usually the actual question.</p>
+          </div>
+        </div>
+        <div class="chart-host chart-host-short" id="gate-chart"></div>
+      </section>
+    </div>
+
+    <!-- trades -->
+    <section class="card card-wide">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Ledger</p>
+          <h3>Trades</h3>
+          <p class="card-sub">Every share bought, at what price, and how it settled.</p>
+        </div>
+        <button id="copy-trades" class="btn btn-ghost btn-sm" type="button">Copy as CSV</button>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table" id="trades-table"></table>
+      </div>
+      <p class="card-foot" id="trades-note"></p>
+    </section>
+
+  </div>
+
+  <!-- The live panels above are per-process and reset on every restart.
+       This is the append-only record on disk, shown whether or not a bot
+       is running. -->
+  <section class="card card-wide" id="history-card" hidden>
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">On disk</p>
+        <h3>History across all runs</h3>
+        <p class="card-sub">Every fill and settlement the bot has ever written. The panels above reset on each restart; this does not.</p>
+      </div>
+    </div>
+    <div class="kpi-row" id="history-kpis"></div>
+    <div class="chart-host chart-host-short" id="history-chart"></div>
+    <div class="table-scroll">
+      <table class="data-table" id="history-table"></table>
+    </div>
+    <div class="pager" id="history-pager"></div>
+  </section>
+</main>
+
+<div id="tooltip" class="tooltip" hidden role="status" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

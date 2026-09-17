@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+data/recordings/*
+!data/recordings/.gitkeep
+*.parquet
+*.jsonl
+# runtime artefacts written by the live bot
+data/live_state.json
+data/live_trades.jsonl
+data/charts/
+data/live_bot.log
+.pytest_cache/
+*.egg-info/
+data/research/

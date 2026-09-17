@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="troll-poly-bot">
+  <!-- Same 145deg Up -> mid -> Down gradient as the header's .brand-mark, so the
+       tab icon and the in-page mark read as one identity. Fixed hex values
+       (not CSS custom properties) because a favicon is rendered outside the
+       page's own stylesheet context. -->
+  <defs>
+    <linearGradient id="g" x1="12%" y1="6%" x2="88%" y2="96%">
+      <stop offset="0%"  stop-color="#2a78d6"/>
+      <stop offset="62%" stop-color="#184f95"/>
+      <stop offset="100%" stop-color="#eb6834"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0.75" y="0.75" width="30.5" height="30.5" rx="8.5"
+        fill="url(#g)" stroke="rgba(0,0,0,0.22)" stroke-width="0.75"/>
+
+  <!-- One 5-minute window: price rises, then falls -- the up/down candle the
+       bot is actually pricing, not an abstract chart glyph. Thick stroke and
+       a single peak marker keep it legible at 16px. -->
+  <path d="M7,21.5 L15.5,9.5 L25,21.5" fill="none" stroke="#ffffff"
+        stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="15.5" cy="9.5" r="2.5" fill="#ffffff" stroke="rgba(0,0,0,0.25)" stroke-width="0.75"/>
+</svg>
