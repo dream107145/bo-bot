@@ -115,6 +115,37 @@ class EngineConfig:
     min_depth_shares: float = 10.0
     cross_ticks: int = 1
 
+    # --- taking profit before settlement ---------------------------------
+    #: A 5m up/down market pays 1.0 or 0.0. Holding a position that has moved
+    #: our way to settlement converts a realisable gain back into a coin flip
+    #: on an oracle print. Selling into the risen bid banks it instead, and
+    #: frees the epoch's risk budget -- every asset in a window is one bet, so
+    #: an early exit is the only way to stop being in it.
+    #:
+    #: This is risk reduction, not an edge. It lowers variance and it also
+    #: lowers expectancy whenever the position would have won: we pay a second
+    #: taker fee and give up the rest of the move. Nothing here claims those
+    #: trade off favourably -- measure it before believing it.
+    take_profit_enabled: bool = True
+    #: Required rise of the best BID above our average entry price, in
+    #: probability units. The bid is what we can actually sell into.
+    take_profit_delta: float = 0.05
+    #: An exit must clear this much profit per share AFTER both fees, or the
+    #: rise is just paying the venue to change our mind.
+    take_profit_min_net: float = 0.005
+    #: Never try to exit inside the last seconds of a window: the order would
+    #: land after close and be rejected, and the books go one-sided there.
+    take_profit_min_secs_left: float = 10.0
+
+    #: The other half of the exit: cap the tail. Without this a position that
+    #: moves against us is held to a 1.0/0.0 print and loses the whole stake.
+    #: Selling at a loss is worse than holding IF the market reverts, so the
+    #: band is wide -- this is a circuit breaker for the windows that have
+    #: already decided against us, not a scalp.
+    stop_loss_enabled: bool = True
+    #: Sell when the best bid falls this far BELOW our average entry.
+    stop_loss_delta: float = 0.20
+
     # --- order flow (Strategy D) ----------------------------------------
     #: Tilt the pricer's mean by an expected drift from spot-exchange order
     #: flow: drift_bps = slope * ofi_score, score in [-1, 1]. The slope is

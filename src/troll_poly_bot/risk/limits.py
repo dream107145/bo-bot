@@ -25,14 +25,21 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class RiskConfig:
-    kelly_fraction: float = 0.25
+    #: Sizing is deliberately SMALL rather than the caps being LOOSE.
+    #: The epoch cap divided by the per-market cap is the real limit on how
+    #: many windows we can be in at once: at 30/10 that was three. Halving the
+    #: per-market stake makes it six, so the bot trades roughly twice as often
+    #: without a single aggregate cap moving -- same money at risk, spread over
+    #: more windows. That also feeds the evidence statistic, which is clustered
+    #: per epoch and needs epochs, not dollars, to ever reach |t| ~ 2.
+    kelly_fraction: float = 0.15           # was 0.25: smaller bets, more of them
     #: Multiply the Kelly stake by the model confidence in [0, 1].
     confidence_scaling: bool = True
-    max_position_usdc: float = 10.0        # per market
-    max_asset_exposure_usdc: float = 20.0  # across a single asset's open markets
-    max_epoch_exposure_usdc: float = 30.0  # all assets, same 300s window
-    max_total_exposure_usdc: float = 50.0
-    max_concurrent_positions: int = 7    # one per listed asset
+    max_position_usdc: float = 5.0         # per market (was 10.0)
+    max_asset_exposure_usdc: float = 15.0  # across a single asset's open markets
+    max_epoch_exposure_usdc: float = 30.0  # all assets, same 300s window -- UNCHANGED
+    max_total_exposure_usdc: float = 50.0  # UNCHANGED
+    max_concurrent_positions: int = 10   # more windows open at once, each smaller
     max_daily_loss_usdc: float = 20.0
     max_drawdown_usdc: float = 30.0
     min_order_usdc: float = 2.0

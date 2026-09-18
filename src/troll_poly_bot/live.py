@@ -61,11 +61,14 @@ from .pricing.vol import EwmaVol, TwoScaleVol
 from .risk.limits import RiskManager
 from .signals.costs import FeeSchedule
 from .strategy.engine import Evaluation, Reason, StrategyEngine
-from .types import BookLevel, OrderBook
+from .types import BookLevel, Order, OrderBook, Side, TimeInForce
 
 log = logging.getLogger("live")
 
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+#: Share counts below this are dust, not a position worth an order and a fee.
+EXIT_EPS = 1e-9
 
 
 # ─────────────────────────────── clock sync ────────────────────────────────
@@ -289,6 +292,9 @@ class LiveMarket:
     inflight: int = 0
     outcome: str | None = None
     pnl: float = 0.0
+    #: closed early by the take-profit rule. Keeps us from re-entering the same
+    #: window we just de-risked, and stops settlement from reporting it twice.
+    exited: bool = False
     settle_attempts: int = 0
     next_settle_ms: float = 0.0
 
@@ -367,6 +373,7 @@ class LiveBot:
         state_path: str = "data/live_state.json",
         trade_log: str = "data/live_trades.jsonl",
         exchanges: tuple[str, ...] | None = None,
+        reset_history: bool = True,
     ) -> None:
         self.cfg = cfg or BotConfig()
         self.cfg.starting_balance = balance
@@ -417,6 +424,9 @@ class LiveBot:
         self.trade_log = Path(trade_log)
         self.chart_dir = Path(self.cfg.chart_dir)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.trade_log.parent.mkdir(parents=True, exist_ok=True)
+        if reset_history:
+            self._reset_trade_log()
 
         self._subscribed: set[str] = set()
         self._resub = asyncio.Event()
@@ -727,12 +737,15 @@ class LiveBot:
             self._on_result(res, now)
 
         self._sample_prices(now)
+        self._take_profit(now)
 
         feed_lag = self.latency.report()["spot_p50"] if self.latency.spot else HOME_BROADBAND.md_spot_base
         for slug, lm in list(self.markets.items()):
             meta = lm.meta
             m = meta.market
-            if m.strike <= 0 or lm.settled or now >= m.close_ts:
+            # `exited` markets are done for the window: re-entering the book we
+            # just de-risked into would pay the spread twice to undo the exit
+            if m.strike <= 0 or lm.settled or lm.exited or now >= m.close_ts:
                 continue
             if lm.inflight > 0:
                 self._count_exec("ORDER_IN_FLIGHT")
@@ -786,6 +799,137 @@ class LiveBot:
                      self.fair_by_order[order.order_id]["p_market"], ev.net_edge, ev.confidence,
                      ev.regime.label if ev.regime else "",
                      0.0 if math.isnan(ev.ofi_score) else ev.ofi_score, ev.ofi_drift_bps, ev.seconds_left)
+
+    def _exit_candidate(self, lm: LiveMarket, token_id: str, now: float) -> dict | None:
+        """Should we sell this token now, and at what price?
+
+        Returns the exit's economics, or None with the reason counted. The
+        price we test is the best BID -- the only price a taker can actually
+        sell into -- and the profit is computed after BOTH fees, entry and
+        exit, so a "profitable" exit is one the ledger will agree with.
+        """
+        cfg = self.cfg.engine
+        pos = self.exchange.positions.get(token_id)
+        if pos is None or pos.shares <= EXIT_EPS:
+            return None
+        size = pos.shares
+        book = lm.books[token_id].to_order_book() if token_id in lm.books else None
+        bid = book.best_bid if book is not None else None
+        if bid is None:
+            self._count_exec("EXIT_NO_BID")
+            return None
+        entry = pos.cost_basis / size                 # average price paid
+        rise = bid - entry
+        if cfg.take_profit_enabled and rise >= cfg.take_profit_delta:
+            kind = "TAKE_PROFIT"
+        elif cfg.stop_loss_enabled and rise <= -cfg.stop_loss_delta:
+            kind = "STOP_LOSS"
+        else:
+            return None
+        # FOK is all-or-nothing: without the depth to clear the whole position
+        # at or above the touch the order is rejected, so do not send it.
+        depth = sum(lvl.size for lvl in book.bids if lvl.price >= bid - EXIT_EPS)
+        if depth + EXIT_EPS < size:
+            self._count_exec("EXIT_THIN_BID")
+            return None
+        fee = self.exchange.fees.charge(bid, size, token_id)
+        # full exit, so the realised PnL is everything the position ever cost
+        pnl = bid * size - fee - pos.cost_basis - pos.fees_paid
+        # A take-profit that does not clear both fees is not a profit. A stop
+        # is allowed to realise a loss -- that is the entire point of it.
+        if kind == "TAKE_PROFIT" and pnl / size < cfg.take_profit_min_net:
+            self._count_exec("EXIT_FEE_EATS_IT")
+            return None
+        return {"size": size, "bid": bid, "entry": entry, "pnl": pnl,
+                "fee": fee, "kind": kind}
+
+    def _take_profit(self, now: float) -> None:
+        """Sell anything that has risen far enough to be worth banking.
+
+        Runs before the entry scan so a position is never added to in the same
+        tick it is being closed in.
+        """
+        cfg = self.cfg.engine
+        if not (cfg.take_profit_enabled or cfg.stop_loss_enabled):
+            return
+        for slug, lm in list(self.markets.items()):
+            m = lm.meta.market
+            if lm.settled or lm.exited or lm.inflight > 0:
+                continue
+            if (m.close_ts - now) / 1000.0 <= cfg.take_profit_min_secs_left:
+                continue
+            for token_id, side in ((m.yes_token_id, "UP"), (m.no_token_id, "DOWN")):
+                ex = self._exit_candidate(lm, token_id, now)
+                if ex is None:
+                    continue
+                order = Order(
+                    token_id=token_id, side=Side.SELL, price=ex["bid"], size=ex["size"],
+                    tif=TimeInForce.FOK, expected_price=ex["bid"],
+                    tag=f"{ex['kind']} {side} entry={ex['entry']:.3f} bid={ex['bid']:.3f}",
+                )
+                self.fair_by_order[order.order_id] = {
+                    "slug": slug, "asset": m.asset, "epoch": lm.epoch,
+                    "token_id": token_id, "side": side, "exit": True,
+                    "kind": ex["kind"], "entry": round(ex["entry"], 4),
+                    "secs_left": round((m.close_ts - now) / 1000.0, 1),
+                }
+                self.exchange.submit(order, now)
+                lm.inflight += 1
+                log.info("%-11s %-26s %-4s %6.2f sh  entry %.3f -> bid %.3f  "
+                         "expect %+.2f  %5.1fs left",
+                         ex["kind"], slug, side, ex["size"], ex["entry"], ex["bid"],
+                         ex["pnl"], (m.close_ts - now) / 1000.0)
+                break                       # one exit order per market per tick
+
+    def _book_exit(self, info: dict, fills: list, now: float) -> None:
+        """Realise an early exit: PnL, risk release, stats and the ledger.
+
+        Deliberately NOT risk.on_fill: this reduces exposure. on_settle is what
+        pops the open position and books the result, which is the same thing
+        settlement does -- an exit is simply a settlement we chose the price of.
+        """
+        slug = info.get("slug", "")
+        lm = self.markets.get(slug)
+        token_id = info.get("token_id", "")
+        pos = self.exchange.positions.get(token_id)
+        size = sum(f.size for f in fills)
+        proceeds = sum(f.price * f.size for f in fills)
+        # everything the position ever cost is still on it; after a full exit
+        # what remains is exactly the realised result
+        pnl = -(pos.cost_basis + pos.fees_paid) if pos is not None else 0.0
+        if pos is not None:
+            pos.cost_basis = 0.0
+            pos.fees_paid = 0.0
+            pos.shares = 0.0
+        asset = info.get("asset", "")
+        epoch = int(info.get("epoch", 0))
+        self.risk.on_settle(slug, pnl, self.clock.now() / 1000.0)
+        self.stats.settled += 1
+        self.stats.realised_pnl += pnl
+        self.pnl_by_asset[asset] = self.pnl_by_asset.get(asset, 0.0) + pnl
+        self.epoch_pnl[epoch] = self.epoch_pnl.get(epoch, 0.0) + pnl
+        if pnl > 0:
+            self.stats.wins += 1
+        else:
+            self.stats.losses += 1
+        if lm is not None:
+            lm.exited = True
+            lm.pnl += pnl
+        avg = proceeds / size if size else 0.0
+        log.info("SOLD  %-26s %-4s %6.2f sh @ %.3f  pnl %+.2f  balance %.2f",
+                 slug, info.get("side", ""), size, avg, pnl, self.exchange.balance)
+        self._ledger_append({
+            "ts": now, "event": "fill", "action": "SELL", **{
+                k: v for k, v in info.items() if k != "exit"},
+            "price": round(avg, 4), "size": round(size, 4),
+            "fee": round(sum(f.fee for f in fills), 4),
+            "cost": round(-proceeds, 4),      # a credit, not a cost
+        })
+        self._ledger_append({
+            "ts": now, "event": "settle", "slug": slug, "asset": asset,
+            "epoch": epoch, "exited": True, "pnl": round(pnl, 4),
+            "balance": round(self.exchange.balance, 4),
+        })
 
     # 200ms sampling, bounded to the window plus a 60s lead-in.
     HISTORY_INTERVAL_MS = 200.0
@@ -884,8 +1028,14 @@ class LiveBot:
         if lm is not None:
             lm.inflight = max(0, lm.inflight - 1)
         if res.is_rejected:
-            self._count_exec(res.reject_reason.value.upper())
-            log.info("REJECT %-25s %s", info.get("slug", "?"), res.reject_reason.value)
+            prefix = "EXIT_" if info.get("exit") else ""
+            self._count_exec(f"{prefix}{res.reject_reason.value.upper()}")
+            log.info("REJECT %-25s %s%s", info.get("slug", "?"), prefix,
+                     res.reject_reason.value)
+            return
+        if info.get("exit") and res.fills:
+            # one round trip closed: booked whole, not fill by fill
+            self._book_exit(info, list(res.fills), now)
             return
         for f in res.fills:
             self.risk.on_fill(info.get("slug", ""), info.get("asset", ""), int(info.get("epoch", 0)),
@@ -899,9 +1049,7 @@ class LiveBot:
                 "slippage": f.slippage, "round_trip_ms": f.round_trip_ms,
                 "cost": round(f.price * f.size, 4),
             }
-            self._append_log(row)
-            self.ledger.append(row)
-            del self.ledger[:-200]
+            self._ledger_append(row)
 
     # ──────────────────────────── settlement ─────────────────────────────
 
@@ -941,6 +1089,11 @@ class LiveBot:
         tw = self.twap[m.asset].trailing_twap(m.close_ts) if m.asset in self.twap else None
         if tw is not None and m.strike > 0:
             ours_up = tw >= m.strike                      # ties resolve Up
+        # read before settle_market() moves anything, so both the resolved and
+        # the unresolvable path below can tell whether we were actually in it
+        had_position = any(
+            abs(self.exchange.positions[t].shares) > 1e-9
+            for t in (m.yes_token_id, m.no_token_id) if t in self.exchange.positions)
         if venue_up is None:
             if lm.settle_attempts < self.SETTLE_MAX_ATTEMPTS:
                 lm.next_settle_ms = self.clock.now() + self.SETTLE_RETRY_MS
@@ -952,6 +1105,18 @@ class LiveBot:
                 self.stats.unresolvable += 1
                 log.warning("%s: no outcome after %d attempts; positions left unsettled",
                             slug, lm.settle_attempts)
+                # The window is over and we will never price it. Say so in the
+                # ledger: without a row here the dashboard has no way to learn
+                # the market ended, and every fill on it reads "open" forever.
+                # pnl is 0.0 because the position is abandoned, not settled --
+                # ``unresolved`` is what distinguishes that from a break-even.
+                if had_position:
+                    self._ledger_append({
+                        "ts": self.clock.now(), "event": "settle", "slug": slug,
+                        "asset": m.asset, "epoch": lm.epoch, "strike": m.strike,
+                        "venue_up": None, "ours_up": None, "unresolved": True,
+                        "pnl": 0.0, "balance": round(self.exchange.balance, 4),
+                    })
                 return
         lm.settled = True
         if venue_up is not None and ours_up is not None and venue_up != ours_up:
@@ -960,15 +1125,14 @@ class LiveBot:
                         "UP" if venue_up else "DOWN", "UP" if ours_up else "DOWN")
         won_up = venue_up if venue_up is not None else ours_up
 
-        had_position = any(
-            abs(self.exchange.positions[t].shares) > 1e-9
-            for t in (m.yes_token_id, m.no_token_id) if t in self.exchange.positions)
         pnl = self.exchange.settle_market(m.yes_token_id, won=bool(won_up))
         pnl += self.exchange.settle_market(m.no_token_id, won=not won_up)
 
         self._archive_chart(slug, lm, won_up, pnl, venue_up)
         lm.outcome = "UP" if won_up else "DOWN"
-        lm.pnl = pnl
+        # += so an early exit's realised PnL survives; for a market held to
+        # settlement lm.pnl is still 0.0 here, so this is the old assignment
+        lm.pnl += pnl
         if lm.submitted:
             self.stats.windows_traded += 1
         if had_position:
@@ -982,14 +1146,11 @@ class LiveBot:
             else:
                 self.stats.losses += 1
             log.info("SETTLE %-25s %-4s  pnl %+.2f  balance %.2f", slug, lm.outcome, pnl, self.exchange.balance)
-            row = {
+            self._ledger_append({
                 "ts": self.clock.now(), "event": "settle", "slug": slug, "asset": m.asset,
                 "epoch": lm.epoch, "strike": m.strike, "venue_up": venue_up, "ours_up": ours_up,
                 "pnl": round(pnl, 4), "balance": round(self.exchange.balance, 4),
-            }
-            self._append_log(row)
-            self.ledger.append(row)
-            del self.ledger[:-200]
+            })
 
     def _archive_chart(self, slug: str, lm: LiveMarket, won_up: bool | None, pnl: float,
                        venue_up: bool | None) -> None:
@@ -1043,6 +1204,27 @@ class LiveBot:
                 fh.write(json.dumps(row) + "\n")
         except OSError:
             log.debug("could not append to trade log")
+
+    def _ledger_append(self, row: dict) -> None:
+        """Record one event to disk and to the in-memory tail the dashboard reads."""
+        self._append_log(row)
+        self.ledger.append(row)
+        del self.ledger[:-200]
+
+    def _reset_trade_log(self) -> None:
+        """Start each run with an empty trade log.
+
+        A restart resets the balance to ``starting_balance``, so carrying the
+        previous run's fills forward makes the dashboard's history describe PnL
+        that the current run's equity does not account for. The per-window
+        recordings in ``data/charts/`` are the durable research record and are
+        left alone. Pass ``reset_history=False`` (``--keep-history``) to append
+        across restarts instead.
+        """
+        try:
+            self.trade_log.write_text("", encoding="utf-8")
+        except OSError:
+            log.debug("could not reset trade log")
 
     def evidence(self) -> dict:
         """Is there edge yet? Per-EPOCH realised PnL, because every asset in a
@@ -1143,6 +1325,10 @@ class LiveBot:
                 "max_book_age_ms": round(self.cfg.engine.max_book_age_ms, 1),
                 "min_net_edge": self.cfg.engine.min_net_edge,
                 "market_blend": self.cfg.engine.market_blend,
+                "take_profit": (self.cfg.engine.take_profit_delta
+                                if self.cfg.engine.take_profit_enabled else 0.0),
+                "stop_loss": (self.cfg.engine.stop_loss_delta
+                              if self.cfg.engine.stop_loss_enabled else 0.0),
                 "trade_window_s": [self.cfg.engine.trade_window_start_s, self.cfg.engine.trade_window_end_s],
             },
             "spot": {a: round(p, 6) for a, p in self.spot.items()},
@@ -1187,7 +1373,7 @@ class LiveBot:
         tmp.write_text(json.dumps(snap, separators=(",", ":")), encoding="utf-8")
         tmp.replace(self.state_path)
 
-    async def state_loop(self, every: float = 0.2) -> None:
+    async def state_loop(self, every: float = 0.1) -> None:
         tmp = self.state_path.with_suffix(".tmp")
         while not self._stop.is_set():
             await asyncio.sleep(every)

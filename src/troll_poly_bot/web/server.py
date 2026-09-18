@@ -38,19 +38,40 @@ LIVE_STATE = Path("data/live_state.json")
 TRADE_LOG = Path("data/live_trades.jsonl")
 
 
-def _filter_live(payload: dict, chart: str | None) -> dict:
+def _filter_live(payload: dict, chart: str | None, since: int | None = None) -> dict:
     """Trim the state to what one page needs.
 
-    The bot writes every live market's full 5-minute history five times a
+    The bot writes every live market's full 5-minute history ten times a
     second; the page only ever draws ONE of them. Sending all of them at that
-    rate is most of the bytes for nothing. ``history_meta`` keeps the point
-    count per market so the picker and the archive exporter still know what
-    exists without receiving it.
+    rate is most of the bytes for nothing -- the full state is ~9 MB, one
+    market ~375 KB. ``history_meta`` keeps the point count per market so the
+    picker and the archive exporter still know what exists without receiving
+    it.
+
+    ``since`` trims further to the points the client does not have yet, which
+    is what makes a 100 ms poll affordable: a steady-state tick is a handful
+    of points rather than the whole window. ``history_partial`` tells the
+    client whether to append or replace. When the client is further behind
+    than the buffer reaches, every point is new, so a full replace is both
+    what it gets and what it wants.
     """
     hist = payload.get("price_history") or {}
     payload["history_meta"] = {slug: len(pts) for slug, pts in hist.items()}
-    if chart is not None:
-        payload["price_history"] = {chart: hist[chart]} if chart in hist else {}
+    if chart is None:
+        # nothing selected: the page draws no chart, so it needs no history
+        payload["price_history"] = {}
+        return payload
+    if chart not in hist:
+        payload["price_history"] = {}
+        return payload
+    pts = hist[chart]
+    if since is not None:
+        fresh = [p for p in pts if p.get("t", 0) > since]
+        # an empty delta for a market we DO have is still {slug: []}, not {}:
+        # it means "nothing new, keep what you hold", not "this market is gone"
+        payload["history_partial"] = len(fresh) < len(pts)
+        pts = fresh
+    payload["price_history"] = {chart: pts}
     return payload
 
 
@@ -476,7 +497,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload["stale_s"] = round(time.time() - LIVE_STATE.stat().st_mtime, 1)
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 chart = (qs.get("chart") or [None])[0]
-                self._json(_filter_live(payload, chart))
+                try:
+                    since = int((qs.get("since") or [None])[0])
+                except (TypeError, ValueError):
+                    since = None
+                self._json(_filter_live(payload, chart, since))
             except (OSError, json.JSONDecodeError):
                 self._json({"running": False}, 200)
         elif path.startswith("/api/job/"):

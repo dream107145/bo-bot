@@ -26,6 +26,15 @@ def main() -> None:
                     help="required NET edge after fees, slippage and the uncertainty charge")
     ap.add_argument("--blend", type=float, default=None,
                     help="weight on the market mid in the blended probability (default 0.5)")
+    ap.add_argument("--take-profit", type=float, default=None,
+                    help="sell early once the best bid is this far above our average "
+                         "entry, in probability units (default 0.05). 0 disables")
+    ap.add_argument("--stop-loss", type=float, default=None,
+                    help="sell when the best bid falls this far BELOW our average entry, "
+                         "in probability units (default 0.20). 0 disables")
+    ap.add_argument("--keep-history", action="store_true",
+                    help="append to data/live_trades.jsonl across restarts. Default is to "
+                         "clear it, because a restart also resets the balance")
     ap.add_argument("--log-level", default="INFO")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after this many seconds (0 = run until Ctrl+C)")
@@ -43,12 +52,21 @@ def main() -> None:
         cfg.engine.min_net_edge = args.min_edge
     if args.blend is not None:
         cfg.engine.market_blend = min(max(args.blend, 0.0), 1.0)
+    if args.take_profit is not None:
+        cfg.engine.take_profit_enabled = args.take_profit > 0
+        if args.take_profit > 0:
+            cfg.engine.take_profit_delta = args.take_profit
+    if args.stop_loss is not None:
+        cfg.engine.stop_loss_enabled = args.stop_loss > 0
+        if args.stop_loss > 0:
+            cfg.engine.stop_loss_delta = args.stop_loss
 
     bot = LiveBot(
         assets=tuple(a.strip().upper() for a in args.assets.split(",") if a.strip()),
         balance=args.balance,
         cfg=cfg,
         exchanges=tuple(e.strip().lower() for e in args.exchanges.split(",") if e.strip()),
+        reset_history=not args.keep_history,
     )
 
     async def runner() -> None:

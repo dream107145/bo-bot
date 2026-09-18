@@ -148,15 +148,46 @@ function renderBotStatus(b) {
 
 let inFlight = false;
 
+/* The server sends only the points we do not have yet, so the drawn history
+   is accumulated here rather than re-downloaded every tick. Without this a
+   100 ms poll would pull ~375 KB each time; with it a steady tick is ~1 KB. */
+let histCache = { slug: null, pts: [] };
+const HISTORY_CAP = 2000;               // matches LiveBot.HISTORY_POINTS
+
 async function pollLive() {
   if (inFlight) return;                 // never stack requests on a slow link
   inFlight = true;
   try {
-    // only the market being drawn comes back with its history; everything
-    // else arrives as a point count in history_meta
-    const q = state.selected ? `?chart=${encodeURIComponent(state.selected)}` : '';
+    // only the market being drawn comes back with its history, and only the
+    // part of it we are missing; everything else is a count in history_meta
+    const slug = state.selected;
+    let q = '';
+    if (slug) {
+      q = `?chart=${encodeURIComponent(slug)}`;
+      if (histCache.slug === slug && histCache.pts.length) {
+        q += `&since=${histCache.pts[histCache.pts.length - 1].t}`;
+      }
+    }
     const live = await fetch('/api/live' + q).then((r) => r.json()).catch(() => null);
     const usable = live && live.running !== false && live.equity != null;
+    if (usable) {
+      if (!slug) {
+        histCache = { slug: null, pts: [] };
+      } else {
+        const incoming = (live.price_history || {})[slug] || [];
+        // append only when this is a delta for the market we already hold;
+        // a switched market or a full resend replaces what we had
+        if (histCache.slug === slug && live.history_partial) {
+          histCache.pts = histCache.pts.concat(incoming);
+          if (histCache.pts.length > HISTORY_CAP) {
+            histCache.pts = histCache.pts.slice(-HISTORY_CAP);
+          }
+        } else {
+          histCache = { slug, pts: incoming };
+        }
+        live.price_history = { [slug]: histCache.pts };
+      }
+    }
     state.live = usable ? live : null;
     $('#idle').hidden = !!usable;
     $('#live').hidden = !usable;
@@ -970,23 +1001,56 @@ function renderAgreement() {
 
 const TRADE_COLS = ['Time', 'Market', 'Side', 'Price', 'Shares', 'Cost', 'Our fair', 'Left', 'Result'];
 
+/* Settlement polls the venue up to SETTLE_MAX_ATTEMPTS x SETTLE_RETRY_MS
+   (5 x 30 s) after a window closes, so a fill is legitimately unresolved for
+   up to ~150 s past its close before anything is wrong. */
+const SETTLE_GRACE_MS = 180000;
+
+/* A fill's own window close, derived from the point it was taken at. The
+   ledger tail carries no market metadata, but every fill records how much of
+   its window was left when it was struck, which is the same thing. */
+function closeTsOf(f) {
+  return f.ts + (f.secs_left || 0) * 1000;
+}
+
+function resultOf(f, s, now) {
+  // a settle row is authoritative whenever we have one
+  if (s && s.unresolved) return { text: 'unresolved', won: null };
+  // closed on the book before the oracle printed: a realised number, not a bet
+  if (s && s.exited) return { text: `${s.pnl >= 0 ? 'banked' : 'cut'} ${fmt.signed(s.pnl)}`,
+                              won: s.pnl >= 0 };
+  if (s) return { text: s.pnl >= 0 ? `won ${fmt.signed(s.pnl)}` : `lost ${fmt.signed(s.pnl)}`,
+                  won: s.pnl >= 0 };
+  // no settle row: distinguish "still trading" from "closed, awaiting the
+  // venue" from "closed long ago and never resolved" -- all three used to
+  // render as "open", which is why resolved markets looked stuck
+  const closed = closeTsOf(f);
+  if (now < closed) return { text: 'open', won: null };
+  if (now < closed + SETTLE_GRACE_MS) return { text: 'settling', won: null };
+  return { text: 'unresolved', won: null };
+}
+
 function tradeRows() {
   const led = state.live.ledger || [];
   const settled = {};
   led.forEach((r) => { if (r.event === 'settle') settled[r.slug] = r; });
+  const now = Date.now();
   return led.filter((r) => r.event === 'fill').slice().reverse().map((f) => {
     const s = settled[f.slug];
+    const res = resultOf(f, s, now);
     return {
       time: fmt.clock(f.ts),
       market: fmt.mkt(f.slug),
-      side: f.side || '—',
+      // an exit is a SELL of the same side we bought; say so rather than
+      // showing a second "UP" row that looks like we doubled down
+      side: f.action === 'SELL' ? `${f.side || '?'} exit` : (f.side || '—'),
       price: f.price.toFixed(3),
       shares: fmt.num(f.size, 1),
       cost: fmt.money(f.cost ?? f.price * f.size),
       fair: (f.p_used == null ? (f.fair ?? 0) : (f.side === 'UP' ? f.p_used : 1 - f.p_used)).toFixed(3),
       left: `${Math.round(f.secs_left || 0)}s`,
-      result: s ? (s.pnl >= 0 ? `won ${fmt.signed(s.pnl)}` : `lost ${fmt.signed(s.pnl)}`) : 'open',
-      won: s ? s.pnl >= 0 : null,
+      result: res.text,
+      won: res.won,
     };
   });
 }
@@ -1218,7 +1282,7 @@ setInterval(pollHistory, 5000);
 
 /* ═══════════════════════════════ wire up ════════════════════════════════ */
 
-/* The chart refreshes five times a second; the tables mostly do not change
+/* The chart refreshes ten times a second; the tables mostly do not change
    that often, and re-rendering a table wipes any text selection the user is
    in the middle of. So each table is rebuilt only when its own data moved. */
 const sigs = {};
@@ -1273,5 +1337,5 @@ applyOverlayLayout();
 
 initTheme();
 poll();
-state.timer = setInterval(pollLive, 200);      // chart cadence
+state.timer = setInterval(pollLive, 100);      // chart cadence
 state.botTimer = setInterval(pollBot, 3000);   // process status
