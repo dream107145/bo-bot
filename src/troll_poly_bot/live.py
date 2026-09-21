@@ -375,6 +375,7 @@ class LiveBot:
         trade_log: str = "data/live_trades.jsonl",
         exchanges: tuple[str, ...] | None = None,
         reset_history: bool = True,
+        exchange=None,
     ) -> None:
         self.cfg = cfg or BotConfig()
         self.cfg.starting_balance = balance
@@ -385,13 +386,22 @@ class LiveBot:
                                       pinned=tuple(a.upper() for a in assets))
 
         self.latency = EmpiricalLatency(HOME_BROADBAND, seed=self.cfg.latency_seed)
-        self.fees = FeeModel.from_schedule(FeeSchedule())
-        self.exchange = PaperExchange(self.latency, self.fees, starting_balance=balance)
+        if exchange is not None:
+            # a real venue adapter (execution/polymarket.py); its fee model is
+            # the one the per-market schedules are written into
+            self.exchange = exchange
+            self.fees = exchange.fees
+        else:
+            self.fees = FeeModel.from_schedule(FeeSchedule())
+            self.exchange = PaperExchange(self.latency, self.fees, starting_balance=balance)
+        self.is_live = bool(getattr(self.exchange, "is_live", False))
         self.risk = RiskManager(cfg=self.cfg.risk, starting_balance=balance)
         self.engine = StrategyEngine(self.cfg.engine, self.risk, FeatureEngine())
         self.strategy_latency: LatencyProfile = HOME_BROADBAND
 
         self.clock = ClockSync()
+        if self.is_live:
+            self.exchange.clock = self.clock.now
         self._base_spot_age = self.cfg.engine.max_spot_age_ms
         self._base_book_age = self.cfg.engine.max_book_age_ms
         self.tracker = StrikeTracker(tolerance_ms=3000.0)
@@ -1135,6 +1145,10 @@ class LiveBot:
                         "UP" if venue_up else "DOWN", "UP" if ours_up else "DOWN")
         won_up = venue_up if venue_up is not None else ours_up
 
+        condition_of = getattr(self.exchange, "condition_of", None)
+        if condition_of is not None:                       # live: lets the venue adapter redeem
+            condition_of[m.yes_token_id] = m.condition_id
+            condition_of[m.no_token_id] = m.condition_id
         pnl = self.exchange.settle_market(m.yes_token_id, won=bool(won_up))
         pnl += self.exchange.settle_market(m.no_token_id, won=not won_up)
 
@@ -1225,6 +1239,11 @@ class LiveBot:
         caller keeps it out of the evidence statistic.
         """
         total = 0.0
+        if self.is_live:
+            # nothing is sold here; the tokens stay in the account and settle
+            # when the venue resolves. Only the risk budget is released.
+            log.warning("%s: unresolved on a REAL account; tokens left in place, no PnL booked", m.slug)
+            return 0.0
         for tid in (m.yes_token_id, m.no_token_id):
             pos = self.exchange.positions.get(tid)
             if pos is None or abs(pos.shares) <= EXIT_EPS:
@@ -1304,6 +1323,12 @@ class LiveBot:
             "total": round(sum(vals), 4),
         }
 
+    @property
+    def mode_label(self) -> str:
+        if not self.is_live:
+            return "live-paper"
+        return "LIVE-ARMED" if getattr(self.exchange, "armed", False) else "live-dry-run"
+
     def snapshot(self) -> dict:
         lr = self.exchange.latency_report()
         equity = self.exchange.equity(self._mark)
@@ -1313,7 +1338,8 @@ class LiveBot:
         for k, v in self.exec_rejections.items():
             skips[k] = skips.get(k, 0) + v
         return {
-            "mode": "live-paper",
+            "mode": self.mode_label,
+            "live": self.exchange.snapshot() if self.is_live else None,
             "started": self.stats.started,
             "uptime_s": round(time.time() - self.stats.started, 1),
             "assets": list(self.assets),
@@ -1485,9 +1511,16 @@ class LiveBot:
     # ─────────────────────────────── driver ──────────────────────────────
 
     async def run(self) -> None:
-        log.info("live paper trading | assets %s | exchanges %s | balance $%.2f | PAPER FILLS ONLY",
-                 ", ".join(self.registry.pinned) or "ALL LISTED", ", ".join(self.exchanges),
-                 self.cfg.starting_balance)
+        if self.is_live:
+            log.warning("%s | assets %s | bankroll $%.2f | %s",
+                        self.mode_label, ", ".join(self.registry.pinned) or "ALL LISTED",
+                        self.cfg.starting_balance,
+                        "REAL ORDERS WILL BE POSTED" if self.mode_label == "LIVE-ARMED"
+                        else "dry run: orders signed, never posted")
+        else:
+            log.info("live paper trading | assets %s | exchanges %s | balance $%.2f | PAPER FILLS ONLY",
+                     ", ".join(self.registry.pinned) or "ALL LISTED", ", ".join(self.exchanges),
+                     self.cfg.starting_balance)
         log.info("resolution is a Chainlink 60s TWAP; the composite spot is a PROXY -- watch basis_disagreements")
         await self.clock.resync()
         log.info("clock offset %+.0fms vs exchange (rtt %.0fms)%s",
@@ -1504,6 +1537,8 @@ class LiveBot:
             asyncio.create_task(self.state_loop()),
             asyncio.create_task(self.report_loop()),
         ]
+        if hasattr(self.exchange, "run"):
+            tasks.append(asyncio.create_task(self.exchange.run(self._stop)))
         try:
             await self._stop.wait()
         finally:

@@ -15,3 +15,4 @@ data/live_bot.log
 .pytest_cache/
 *.egg-info/
 data/research/
+data/KILL

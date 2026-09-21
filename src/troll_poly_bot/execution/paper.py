@@ -58,6 +58,12 @@ class RejectReason(str, Enum):
     TICK_SIZE = "tick_size"
     MIN_SIZE = "min_size"
     INSUFFICIENT_BALANCE = "insufficient_balance"
+    # real-money adapter (execution/polymarket.py)
+    DRY_RUN = "dry_run"                    # signed locally, deliberately not posted
+    KILL_SWITCH = "kill_switch"            # the kill file exists
+    HALTED = "halted"                      # daily loss or repeated API errors
+    LIVE_CAPS = "live_caps"                # per-order / open / rate cap
+    API_ERROR = "api_error"                # the venue could not be reached
 
 
 @dataclass(slots=True)

@@ -999,6 +999,22 @@ async function archiveClosedWindows() {
 
 /* ═══════════════════════════════ tables ═════════════════════════════════ */
 
+function modeLabel(d) {
+  if (d.mode === 'LIVE-ARMED') return 'REAL MONEY · ';
+  if (d.mode === 'live-dry-run') return 'live dry run · ';
+  return '';
+}
+
+function liveLine(lv) {
+  if (!lv) return '';
+  const bits = [];
+  if (lv.venue_balance != null) bits.push(`account ${fmt.money(lv.venue_balance)}`);
+  if (lv.pending_redemption) bits.push(`pending redemption ${fmt.money(lv.pending_redemption)}`);
+  if (lv.halted) bits.push(`HALTED: ${lv.halted}`);
+  if (lv.kill_file_present) bits.push('KILL FILE PRESENT');
+  return bits.length ? ' · ' + bits.join(' · ') : '';
+}
+
 function byAsset(m) {
   const e = Object.entries(m || {});
   return e.length ? ' · by asset ' + e.map(([a, v]) => `${a} ${fmt.signed(v)}`).join(', ') : '';
@@ -1046,10 +1062,11 @@ function renderHero() {
   const h = $('#hero-equity');
   h.textContent = fmt.money(d.equity);
   h.className = 'hero-figure ' + (d.pnl >= 0 ? 'pos' : 'neg');
-  $('#hero-sub').textContent =
-    `${fmt.signed(d.pnl)} from ${fmt.money(d.starting_balance)} · `
+  $('#hero-sub').textContent = modeLabel(d)
+    + `${fmt.signed(d.pnl)} from ${fmt.money(d.starting_balance)} · `
     + `realised ${fmt.signed(d.realised_pnl || 0)} · up ${Math.round((d.uptime_s || 0) / 60)}m`
-    + byAsset(d.pnl_by_asset) + feedsLine(d.feeds);
+    + byAsset(d.pnl_by_asset) + feedsLine(d.feeds) + liveLine(d.live);
+  $('#hero-sub').classList.toggle('neg', d.mode === 'LIVE-ARMED');
 
   const s = d.stats || {}, o = d.orders || {}, e = d.evidence || {}, r = d.risk || {};
   const kpis = [

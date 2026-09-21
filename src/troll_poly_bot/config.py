@@ -89,8 +89,20 @@ class FeedConfig:
 
 
 @dataclass(slots=True)
+class LiveConfig:
+    """Real-money switches. Credentials are NOT here: they are read from the
+    environment by execution/polymarket.py and never stored in a config."""
+    armed: bool = False                   # False = dry run: sign, never post
+    max_order_usdc: float = 5.0
+    max_open_usdc: float = 25.0
+    max_daily_loss_usdc: float = 10.0
+    max_orders_per_hour: int = 60
+    kill_file: str = "data/KILL"
+
+
+@dataclass(slots=True)
 class BotConfig:
-    mode: str = "paper"                   # paper | live (live is not wired)
+    mode: str = "paper"                   # paper | live
     latency_profile: str = "home_broadband"
     latency_seed: int = 7
     starting_balance: float = 100.0
@@ -101,6 +113,7 @@ class BotConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     vol: VolConfig = field(default_factory=VolConfig)
     feeds: FeedConfig = field(default_factory=FeedConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
 
     record_dir: str = "data/recordings"
     chart_dir: str = "data/charts"
@@ -138,9 +151,10 @@ class BotConfig:
             os.getenv("TPB_STARTING_BALANCE", cfg.starting_balance)
         )
         cfg.log_level = os.getenv("TPB_LOG_LEVEL", cfg.log_level)
-        if cfg.mode != "paper":
-            raise SystemExit(
-                "live mode is not implemented. Run paper until the evidence "
-                "statistic in the dashboard shows edge net of fees."
-            )
+        if cfg.mode not in ("paper", "live"):
+            raise SystemExit(f"TPB_MODE must be paper or live, not {cfg.mode!r}")
+        if cfg.mode == "live":
+            # live is dry-run unless explicitly acknowledged; the CLI enforces
+            # the same rule for --armed
+            cfg.live.armed = os.getenv("TPB_LIVE_ACK", "").strip() == "I_UNDERSTAND_REAL_MONEY"
         return cfg

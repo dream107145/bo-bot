@@ -234,9 +234,10 @@ An "Real balance and trade history" panel then appears with portfolio value,
 open positions marked to market, unrealised PnL and recent trades, straight
 from the venue. `GET /api/account` is the same data.
 
-Use the **proxy wallet** -- the Gnosis-Safe-style wallet Polymarket trades from
--- not the EOA that controls it. They are different addresses and the API knows
-nothing about the latter. It is in the Polymarket UI under your profile.
+Use the **account wallet** shown under your Polymarket profile (a Deposit
+Wallet for accounts since May 2026, a Gnosis-Safe proxy for older ones), not
+the signer key address. They are different addresses and the API knows nothing
+about the latter.
 
 What this deliberately is *not*:
 
@@ -257,13 +258,65 @@ rather than showing a stale number as current. The server caches for 10 s and
 the page refreshes every 15 s; the endpoint is free, which is exactly why it
 should not be hammered.
 
-**Live order placement is a separate thing and is still not wired.**
-`BotConfig.from_env` refuses any mode but `paper`. That path needs a private
-key, EIP-712 L1 auth to derive L2 HMAC credentials, USDC allowances on Polygon,
-and an execution adapter replacing `PaperExchange` -- order signing, real
-partial-fill and reject handling, position reconciliation against the venue
-instead of our own bookkeeping, and a kill switch that works when the API is
-down mid-window.
+## Trading the real account (`--live`)
+
+The same strategy, the same gates, a real venue behind them. Read
+[docs/strategy.md](docs/strategy.md) first: the evidence for an edge is thin
+and the fee curve is unforgiving. Then, if you still want to:
+
+```bash
+python -m pip install -e ".[live]"          # adds polymarket-client, the unified SDK
+cp .env.example .env                        # fill in the real-money block, keep it out of git
+python -m troll_poly_bot --live --balance 50             # DRY RUN: authenticates, signs, posts nothing
+python -m troll_poly_bot --live --armed --balance 50     # real fill-or-kill orders
+```
+
+What goes in `.env`: `TPB_POLY_PRIVATE_KEY` (the key that signs; for an email
+login it is exported from your profile settings) and `TPB_POLY_WALLET`, the
+account wallet shown under your Polymarket profile (older name
+`TPB_POLY_FUNDER`). The signer's address and the profile address are
+different, and that is how it should be: since May 2026 every account is a
+**Deposit Wallet**, a contract the signer controls, and the venue reports the
+wallet type itself, so nothing about signature types needs configuring.
+`python scripts/live_check.py` prints only addresses and balances and says
+whether the account is ready. `--armed` additionally requires
+`TPB_LIVE_ACK=I_UNDERSTAND_REAL_MONEY`.
+
+The venue moved to CLOB V2 in April 2026. The bot trades through Polymarket's
+unified `polymarket-client` SDK, which signs V2 orders, including the
+ERC-1271 signatures a Deposit Wallet needs. Each order goes out as a
+fill-or-kill market order with a price bound, the V2 shape of the paper
+engine's FOK limit order.
+
+Three locks, in order:
+
+1. **Dry run by default.** `--live` without `--armed` does everything except
+   POST: it reads the real balance and allowance, reconciles every 30 s, and
+   signs each order the strategy wants, logging it as `DRY_RUN`. Run this
+   until the log looks like what you expect.
+2. **Arming is explicit twice** -- the flag and the acknowledgement variable.
+   The dashboard's Start button can never arm the bot.
+3. **Caps outside the strategy** (`--max-order-usdc 5`, `--max-open-usdc 25`,
+   `--max-daily-loss 10`, `--max-orders-per-hour 60`) plus a **kill file**:
+   create `data/KILL` and nothing further is sent. Five consecutive venue
+   errors also halt it. Orders are fill-or-kill only, so stopping the process
+   never leaves a resting order behind.
+
+Bankroll: `--balance` is what the risk caps scale to, capped to what the
+account holds. The bot's balance is that bankroll plus the venue's cash
+change since start; the account's real balance is shown separately.
+
+**Redemption.** A winning token pays out only once it is redeemed, and a
+Deposit Wallet (or legacy proxy) redeems through Polymarket's relayer. Give
+the bot a **Relayer API key** (app: Settings -> API Keys -> Relayer API Keys;
+`TPB_POLY_RELAYER_API_KEY` and `TPB_POLY_RELAYER_API_KEY_ADDRESS` in `.env`)
+and it redeems each resolved winner itself, retrying while the market is
+still settling on-chain. Without one, turn on **Auto-Redeem** in the app.
+Either way, until the cash lands the amount shows as *pending redemption*
+and is counted in equity; the next reconciliation retires it.
+
+Fees are estimated from the market's schedule per fill; the venue's real
+deduction is what the balance reconciliation reflects.
 
 ## The dashboard
 

@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 research = ["pandas>=2.1", "pyarrow>=14.0", "matplotlib>=3.8"]
+live = ["polymarket-client>=0.10"]
 
 [build-system]
 requires = ["setuptools>=68"]

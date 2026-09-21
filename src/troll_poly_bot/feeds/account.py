@@ -10,9 +10,10 @@ cancel or modify an order, and it never touches the bot's strategy, risk config
 or paper exchange. It runs in the dashboard process, not the trading process,
 so a hung HTTP call cannot stall a trading tick.
 
-The address wanted here is the **proxy wallet** -- the Gnosis-Safe-style wallet
-Polymarket trades from -- not the EOA that controls it. They are different
-addresses and the API knows nothing about the latter.
+The address wanted here is the **account wallet** shown under your Polymarket
+profile (a Deposit Wallet since May 2026, a Gnosis-Safe proxy for older
+accounts), not the signer key address. They are different addresses and the
+API knows nothing about the latter.
 """
 from __future__ import annotations
 

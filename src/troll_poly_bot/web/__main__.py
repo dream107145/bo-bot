@@ -13,7 +13,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--wallet", default=None,
-                    help="Polymarket PROXY wallet address to show read-only balance, "
+                    help="Polymarket account wallet (the address on your profile) to show read-only balance, "
                          "positions and trade history for. Also TPB_POLYMARKET_WALLET. "
                          "No key is involved and nothing here can place an order")
     args = ap.parse_args()
