@@ -190,6 +190,24 @@
     </div>
     <div class="pager" id="history-pager"></div>
   </section>
+
+  <section class="card card-wide" id="account-card" hidden>
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Polymarket account &middot; read only</p>
+        <h3>Real balance and trade history</h3>
+        <p class="card-sub">Live from the venue's public Data API for one wallet address. Nothing here is connected to the paper bot above &mdash; it places no orders and holds no key.</p>
+      </div>
+      <div class="card-actions"><span class="badge" id="account-age"></span></div>
+    </div>
+    <div class="kpi-row" id="account-kpis"></div>
+    <div class="table-scroll">
+      <table class="data-table" id="account-positions"></table>
+    </div>
+    <div class="table-scroll">
+      <table class="data-table" id="account-trades"></table>
+    </div>
+  </section>
 </main>
 
 <div id="tooltip" class="tooltip" hidden role="status" aria-live="polite"></div>

@@ -11,7 +11,9 @@ cancelled: the sim takes a progress callback that aborts when it returns False.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import logging
 import mimetypes
 import re
@@ -28,7 +30,9 @@ from pathlib import Path
 from typing import Any
 
 from ..execution.latency import PROFILES
+from ..feeds import account
 from ..sim import SimResult, run_sim
+from . import ws
 from .schema import apply_params, build_schema
 
 log = logging.getLogger(__name__)
@@ -397,6 +401,85 @@ class BotController:
 BOT = BotController()
 
 
+class _AccountCache:
+    """A real account, read on a timer rather than on every request.
+
+    The Data API is public and free, which is exactly why this must not hammer
+    it: the panel refreshes on a 15 s timer and several open tabs would
+    otherwise multiply that. Reads are served from here; one thread at a time
+    goes out to the network, and a failure keeps serving the last good
+    snapshot with its age attached so the page can say the number is stale
+    rather than silently showing an old one as current.
+    """
+
+    TTL_S = 10.0
+
+    def __init__(self) -> None:
+        self.wallet: str | None = os.environ.get("TPB_POLYMARKET_WALLET") or None
+        self._snap: dict | None = None
+        self._at = 0.0
+        self._lock = threading.Lock()
+
+    def get(self) -> dict:
+        if not self.wallet:
+            return {"configured": False,
+                    "hint": "set TPB_POLYMARKET_WALLET to your Polymarket proxy "
+                            "wallet address, or pass --wallet"}
+        with self._lock:
+            fresh = self._snap is not None and (time.time() - self._at) < self.TTL_S
+            if not fresh:
+                try:
+                    self._snap = account.snapshot(self.wallet)
+                    self._at = time.time()
+                except account.AccountError as exc:
+                    if self._snap is None:
+                        return {"configured": True, "wallet": self.wallet,
+                                "error": str(exc)}
+                    self._snap = dict(self._snap, error=str(exc))
+            snap = dict(self._snap or {})
+        snap["configured"] = True
+        snap["age_s"] = round(time.time() - self._at, 1)
+        return snap
+
+
+ACCOUNT = _AccountCache()
+
+#: How often the push loop stats the state file. The bot writes it at 10 Hz, so
+#: this only decides how much of a 100 ms tick is spent waiting -- not the rate.
+WS_WATCH_S = 0.02
+#: Idle keepalive. Proxies drop a silent socket long before this matters, and a
+#: dead peer is otherwise only noticed when the bot next writes.
+WS_PING_S = 20.0
+
+
+class _Subscription:
+    """What one connected page is watching. Shared across its two threads."""
+
+    __slots__ = ("chart", "since", "closed", "lock")
+
+    def __init__(self) -> None:
+        self.chart: str | None = None
+        self.since: int | None = None
+        self.closed = False
+        self.lock = threading.Lock()
+
+    def select(self, chart: str | None) -> None:
+        with self.lock:
+            self.chart = chart
+            # a different market shares no points with the old one, so the next
+            # push must be a full history rather than a delta
+            self.since = None
+
+    def snapshot(self) -> tuple[str | None, int | None]:
+        with self.lock:
+            return self.chart, self.since
+
+    def advance(self, since: int | None) -> None:
+        with self.lock:
+            if since is not None:
+                self.since = since
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "troll-poly-bot"
 
@@ -474,14 +557,140 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------------- GET
 
+    # ----------------------------------------------------------- websocket
+
+    def _ws_send(self, sock_lock: threading.Lock, data: bytes) -> None:
+        with sock_lock:
+            self.wfile.write(data)
+            self.wfile.flush()
+
+    def _ws_reader(self, sub: _Subscription, sock_lock: threading.Lock) -> None:
+        """Client -> server: only ever a subscription change, a ping or a close.
+
+        Its own thread because the push loop must not block on a client that
+        never speaks, and a blocking read is the only way to notice one that
+        hangs up.
+        """
+        try:
+            while not sub.closed:
+                opcode, payload = ws.read_frame(self.rfile.read)
+                if opcode == ws.OP_CLOSE:
+                    break
+                if opcode == ws.OP_PING:
+                    self._ws_send(sock_lock, ws.encode_frame(payload, ws.OP_PONG))
+                    continue
+                if opcode != ws.OP_TEXT:
+                    continue
+                try:
+                    msg = json.loads(payload.decode() or "{}")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(msg, dict) and "chart" in msg:
+                    chart = msg["chart"]
+                    sub.select(chart if isinstance(chart, str) and chart else None)
+        except (ws.WSError, OSError, ValueError):
+            pass
+        finally:
+            sub.closed = True
+
+    def _ws_live(self) -> None:
+        """Push the live state as it is written, instead of being polled for it.
+
+        Same payload as GET /api/live, same `chart`/`since` trimming -- this
+        changes the transport, not the contract, so the page can fall back to
+        polling without the server caring.
+        """
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+            self._json({"error": "expected a websocket upgrade"}, 400)
+            return
+        self.close_connection = True          # this socket leaves HTTP behind
+        sock_lock = threading.Lock()
+        sub = _Subscription()
+        # the page names its market in the upgrade URL so the FIRST push is
+        # already the right one, instead of a full state we then throw away
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        sub.select((qs.get("chart") or [None])[0] or None)
+        try:
+            self.wfile.write(ws.handshake_response(key))
+            self.wfile.flush()
+        except OSError:
+            return
+
+        reader = threading.Thread(target=self._ws_reader, args=(sub, sock_lock),
+                                  daemon=True)
+        reader.start()
+
+        last_mtime = -1.0
+        last_ping = time.time()
+        try:
+            while not sub.closed:
+                now = time.time()
+                try:
+                    mtime = LIVE_STATE.stat().st_mtime
+                except OSError:
+                    mtime = -1.0
+                if mtime != last_mtime and mtime > 0:
+                    chart, since = sub.snapshot()
+                    payload = self._live_payload(chart, since)
+                    if payload is None:
+                        # caught the writer mid-file; leave last_mtime alone so
+                        # this same write is retried rather than skipped
+                        time.sleep(WS_WATCH_S)
+                        continue
+                    last_mtime = mtime
+                    pts = (payload.get("price_history") or {}).get(chart or "")
+                    if pts:
+                        sub.advance(pts[-1].get("t"))
+                    self._ws_send(sock_lock,
+                                  ws.encode_frame(json.dumps(payload).encode()))
+                    last_ping = now
+                elif now - last_ping >= WS_PING_S:
+                    self._ws_send(sock_lock, ws.encode_frame(b"", ws.OP_PING))
+                    last_ping = now
+                else:
+                    time.sleep(WS_WATCH_S)
+        except (OSError, ValueError):
+            pass
+        finally:
+            sub.closed = True
+            with contextlib.suppress(OSError, ValueError):
+                self._ws_send(sock_lock, ws.close_frame())
+
+    @staticmethod
+    def _live_payload(chart: str | None, since: int | None) -> dict | None:
+        """The live state trimmed for one viewer, or None if it is unreadable.
+
+        None specifically means "could not read it *this time*" -- a torn read
+        while the bot rewrites the file, which at 10 Hz happens. Callers must
+        not turn that into `running: false`: the page would blank a working
+        dashboard for one frame every time it caught the writer mid-stride.
+        """
+        try:
+            payload = json.loads(LIVE_STATE.read_text(encoding="utf-8"))
+            mtime = LIVE_STATE.stat().st_mtime
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload["stale_s"] = round(time.time() - mtime, 1)
+        return _filter_live(payload, chart, since)
+
+    # ---------------------------------------------------------------- GET
+
     def do_GET(self) -> None:                              # noqa: N802
         path = self.path.split("?")[0]
-        if path in ("/", "/index.html"):
+        if path == "/ws":
+            self._ws_live()
+        elif path in ("/", "/index.html"):
             self._static("index.html")
         elif path == "/api/schema":
             self._json(build_schema())
         elif path == "/api/bot":
             self._json(BOT.status())
+        elif path == "/api/account":
+            # read-only: this endpoint cannot place, cancel or modify an order
+            self._json(ACCOUNT.get())
         elif path == "/api/history":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             page = _qs_int(qs, "page", 1)
@@ -491,19 +700,15 @@ class Handler(BaseHTTPRequestHandler):
             # Written by the live paper trader (python -m troll_poly_bot).
             # Served read-only so the dashboard can show it without the two
             # processes needing to know about each other.
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            chart = (qs.get("chart") or [None])[0]
             try:
-                raw = LIVE_STATE.read_text(encoding="utf-8")
-                payload = json.loads(raw)
-                payload["stale_s"] = round(time.time() - LIVE_STATE.stat().st_mtime, 1)
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                chart = (qs.get("chart") or [None])[0]
-                try:
-                    since = int((qs.get("since") or [None])[0])
-                except (TypeError, ValueError):
-                    since = None
-                self._json(_filter_live(payload, chart, since))
-            except (OSError, json.JSONDecodeError):
-                self._json({"running": False}, 200)
+                since = int((qs.get("since") or [None])[0])
+            except (TypeError, ValueError):
+                since = None
+            # same builder the websocket uses, so the two transports cannot
+            # drift apart in what they consider a payload
+            self._json(self._live_payload(chart, since) or {"running": False})  # noqa: E501
         elif path.startswith("/api/job/"):
             job = MANAGER.get(path.rsplit("/", 1)[-1])
             self._json(job.snapshot() if job else {"error": "unknown job"},

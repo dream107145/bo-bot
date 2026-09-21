@@ -162,6 +162,30 @@ is checked first, and its fee guard never applies to a stop -- refusing to cut
 a loss because the exit costs a fee is how a small loss becomes the whole
 stake.
 
+## When a window never resolves
+
+The venue outcome does not always arrive. After `SETTLE_MAX_ATTEMPTS` retries
+with no TWAP of our own to fall back on, the window is abandoned: the position
+is flattened at its last mark, **the risk budget is handed back**, and a ledger
+row goes out with `unresolved: true, marked: true`.
+
+That middle part is not a detail. An abandoned window used to keep its entry in
+the risk manager's open book forever, and each one consumed a slot out of
+`max_concurrent_positions` permanently:
+
+> 2026-09-19, 17:07-17:17 UTC. Ten windows failed to resolve inside one
+> ten-minute venue outage. That took the bot to exactly 10 of 10 open
+> positions, and it bought nothing for the next **twenty hours** -- 8,985
+> `RISK_LIMIT` refusals -- while every feed was green, the book lag was 110 ms
+> and the dashboard looked entirely healthy.
+
+`_reap` now carries the same guarantee as a backstop: **nothing leaves it still
+on the risk book**, whatever the reason settlement did not run.
+
+The marked PnL is an estimate, so it is kept out of `epoch_pnl` and out of the
+win/loss counts -- it moves the balance, because the money really did move, but
+it is not evidence of edge in either direction.
+
 ## Trading more often without risking more
 
 The frequency limit was never the signal, it was the arithmetic:
@@ -195,6 +219,52 @@ docs/strategy.md already measured 0.02 against 0.05: 4.5x the fills at
 frequency with thinner and less proven edge, which is the opposite of safer.
 `--min-edge 0.015` is there if you want to make that trade explicitly.
 
+## Connecting a real Polymarket account (read only)
+
+The venue's Data API serves on-chain positions to anyone who asks: **no key, no
+signature, no credentials**. All this needs is a wallet address.
+
+```bash
+python -m troll_poly_bot.web --wallet 0xYOUR_PROXY_WALLET
+# or
+export TPB_POLYMARKET_WALLET=0xYOUR_PROXY_WALLET
+```
+
+An "Real balance and trade history" panel then appears with portfolio value,
+open positions marked to market, unrealised PnL and recent trades, straight
+from the venue. `GET /api/account` is the same data.
+
+Use the **proxy wallet** -- the Gnosis-Safe-style wallet Polymarket trades from
+-- not the EOA that controls it. They are different addresses and the API knows
+nothing about the latter. It is in the Polymarket UI under your profile.
+
+What this deliberately is *not*:
+
+* It **cannot place, cancel or modify an order**. `feeds/account.py` issues GET
+  requests to a public endpoint and holds no key; a test parses the module and
+  fails if it ever imports anything capable of signing, or builds a request
+  with a body.
+* It **does not touch the bot**. The panel lives in the dashboard process, so a
+  slow HTTP call cannot stall a trading tick, and no strategy, risk or engine
+  value is read from or written to the account.
+* The paper bot **keeps paper trading**. The two sets of numbers sit side by
+  side on purpose: one is what the strategy did on simulated fills, the other
+  is what the account actually holds. Reconciling them is the point.
+
+Each section carries its own error, so a rate-limited positions call does not
+blank the balance that loaded fine, and the panel says how old the data is
+rather than showing a stale number as current. The server caches for 10 s and
+the page refreshes every 15 s; the endpoint is free, which is exactly why it
+should not be hammered.
+
+**Live order placement is a separate thing and is still not wired.**
+`BotConfig.from_env` refuses any mode but `paper`. That path needs a private
+key, EIP-712 L1 auth to derive L2 HMAC credentials, USDC allowances on Polygon,
+and an execution adapter replacing `PaperExchange` -- order signing, real
+partial-fill and reject handling, position reconciliation against the venue
+instead of our own bookkeeping, and a kill switch that works when the API is
+down mid-window.
+
 ## The dashboard
 
 `python -m troll_poly_bot.web` serves the console on loopback. Start / Stop /
@@ -205,14 +275,34 @@ chart with fill markers, **open markets with the engine decision on each**
 and regime, trades, the **reason-code bar chart** ("why it is not trading"),
 and the on-disk history across restarts.
 
-The chart redraws **10x a second**: the bot writes `data/live_state.json` every
-100 ms and the page polls at the same cadence. That is only affordable because
-`/api/live` sends the drawn market's history and nothing else, and `?since=<t>`
-trims it again to the points the client is missing -- a steady tick is ~5 KB
-against ~9.6 MB if the whole state went out. If the chart ever feels sluggish,
-check the response size before touching the interval; the poll is guarded by an
-`inFlight` flag, so a payload that takes longer than a tick to arrive silently
-becomes the real refresh rate.
+The chart is **pushed, not polled**. The page opens a websocket to `/ws` and
+the server sends the state as the bot writes it -- measured 9.5 pushes/sec at
+~6 KB each, a 3 ms first paint. Polling `/api/live` stays wired as the
+fallback: identical payloads, so if the socket will not open or drops, the page
+carries on without noticing. The subscription rides on the URL
+(`/ws?chart=<slug>`) so the first push is already the right market, and
+`{"chart": ...}` switches it without reconnecting.
+
+`web/ws.py` is a small hand-rolled RFC 6455 server rather than a dependency,
+because the dashboard runs on `http.server` and must stay on ONE port -- a
+second listener would need a second hole in the firewall. It implements the
+subset the page needs and *refuses* the rest (continuation frames, unmasked
+client frames, frames over 64 KiB) instead of half-supporting them.
+
+Two things were capping the refresh rate before the transport ever mattered:
+
+* `price_history` is keyed by slug and `_reap` never pruned it. Each market's
+  deque is capped; the NUMBER of markets was not. 244 markets and 154k points
+  had piled into a **41 MB** state file, and writing that takes ~1 s -- so the
+  dashboard ran at **1 Hz** no matter what `state_loop`'s interval said. Closed
+  windows are archived to `data/charts/`, so pruning loses nothing. Now 0.14 MB.
+* The 10 Hz write used `json.dumps`. It is `orjson` now (~8x faster on this
+  payload, and already a dependency), with `OPT_NON_STR_KEYS` because
+  `epoch_pnl` is keyed by int epoch.
+
+If the chart ever feels sluggish again, **measure the state file first**: its
+size and write rate cap everything downstream, and no transport can beat the
+rate at which the data is produced.
 
 A trader the console did not spawn is still *detected* -- from the mtime of
 `data/live_state.json` -- and shown as running, but the console says so plainly

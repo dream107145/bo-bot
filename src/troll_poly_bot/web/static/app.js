@@ -154,7 +154,37 @@ let inFlight = false;
 let histCache = { slug: null, pts: [] };
 const HISTORY_CAP = 2000;               // matches LiveBot.HISTORY_POINTS
 
+/* Apply one live payload, whichever transport carried it. The websocket and
+   the polling fallback send byte-identical messages, so this is the only place
+   that understands the shape. */
+function applyLive(live, slug) {
+  const usable = live && live.running !== false && live.equity != null;
+  if (usable) {
+    if (!slug) {
+      histCache = { slug: null, pts: [] };
+    } else {
+      const incoming = (live.price_history || {})[slug] || [];
+      // append only when this is a delta for the market we already hold;
+      // a switched market or a full resend replaces what we had
+      if (histCache.slug === slug && live.history_partial) {
+        histCache.pts = histCache.pts.concat(incoming);
+        if (histCache.pts.length > HISTORY_CAP) {
+          histCache.pts = histCache.pts.slice(-HISTORY_CAP);
+        }
+      } else {
+        histCache = { slug, pts: incoming };
+      }
+      live.price_history = { [slug]: histCache.pts };
+    }
+  }
+  state.live = usable ? live : null;
+  $('#idle').hidden = !!usable;
+  $('#live').hidden = !usable;
+  if (usable) render();
+}
+
 async function pollLive() {
+  if (wsLive && wsLive.readyState === WebSocket.OPEN) return;   // push is driving
   if (inFlight) return;                 // never stack requests on a slow link
   inFlight = true;
   try {
@@ -169,32 +199,135 @@ async function pollLive() {
       }
     }
     const live = await fetch('/api/live' + q).then((r) => r.json()).catch(() => null);
-    const usable = live && live.running !== false && live.equity != null;
-    if (usable) {
-      if (!slug) {
-        histCache = { slug: null, pts: [] };
-      } else {
-        const incoming = (live.price_history || {})[slug] || [];
-        // append only when this is a delta for the market we already hold;
-        // a switched market or a full resend replaces what we had
-        if (histCache.slug === slug && live.history_partial) {
-          histCache.pts = histCache.pts.concat(incoming);
-          if (histCache.pts.length > HISTORY_CAP) {
-            histCache.pts = histCache.pts.slice(-HISTORY_CAP);
-          }
-        } else {
-          histCache = { slug, pts: incoming };
-        }
-        live.price_history = { [slug]: histCache.pts };
-      }
-    }
-    state.live = usable ? live : null;
-    $('#idle').hidden = !!usable;
-    $('#live').hidden = !usable;
-    if (usable) render();
+    applyLive(live, slug);
   } catch { /* transient; next tick retries */ } finally {
     inFlight = false;
   }
+}
+
+/* ─────────────────────────── the push transport ───────────────────────────
+   The bot writes state at 10 Hz and the server pushes each write down this
+   socket, so the chart redraws when the data changes rather than when a timer
+   happens to fire. Polling stays wired as the fallback: if the socket will not
+   open or drops, `pollLive` takes over on the next tick without the page
+   noticing, and the payloads are identical either way. */
+let wsLive = null;
+let wsRetry = 0;
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const slug = state.selected;
+  return `${proto}//${location.host}/ws` +
+         (slug ? `?chart=${encodeURIComponent(slug)}` : '');
+}
+
+function connectLive() {
+  let sock;
+  try {
+    sock = new WebSocket(wsUrl());
+  } catch {
+    return;                             // polling is already running
+  }
+  wsLive = sock;
+  sock.onopen = () => { wsRetry = 0; };
+  sock.onmessage = (ev) => {
+    try {
+      applyLive(JSON.parse(ev.data), state.selected);
+    } catch { /* one bad frame must not stop the stream */ }
+  };
+  sock.onclose = () => {
+    if (wsLive === sock) wsLive = null;
+    // back off to a few seconds so a server restart does not get hammered;
+    // pollLive is serving the page in the meantime
+    wsRetry = Math.min(wsRetry + 1, 5);
+    setTimeout(connectLive, 500 * wsRetry);
+  };
+  sock.onerror = () => { try { sock.close(); } catch { /* already gone */ } };
+}
+
+/* Tell the socket which market to stream. Cheap enough to call on every
+   selection change; no reconnect, and the server answers with a full history
+   for the new market rather than a delta against the old one's timestamps. */
+function setSelected(slug) {
+  if (state.selected === slug) return;
+  state.selected = slug;
+  histCache = { slug: null, pts: [] };   // the new market shares no points
+  sendChartSelection();
+}
+
+function sendChartSelection() {
+  if (wsLive && wsLive.readyState === WebSocket.OPEN) {
+    try {
+      wsLive.send(JSON.stringify({ chart: state.selected || null }));
+    } catch { /* the close handler will reconnect */ }
+  }
+}
+
+/* ───────────────────── real Polymarket account (read only) ─────────────────
+   A separate panel on purpose. It reports the venue's own numbers for one
+   wallet, fetched from the public Data API; it shares nothing with the paper
+   bot above and can place no orders. Refreshed on a slow timer because the
+   endpoint is public and free -- the server caches it too. */
+const ACCOUNT_POLL_MS = 15000;
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function renderAccount(a) {
+  const card = $('#account-card');
+  if (!a || a.configured === false) { card.hidden = true; return; }
+  card.hidden = false;
+
+  const stale = a.age_s != null && a.age_s > 60;
+  $('#account-age').textContent = a.error ? `stale · ${esc(a.error)}`
+    : (a.age_s == null ? '' : `updated ${a.age_s.toFixed(0)}s ago`);
+  $('#account-age').className = 'badge';
+
+  const pos = a.positions || [];
+  const kpis = [
+    { l: 'Portfolio value', v: a.value == null ? '—' : fmt.money(a.value),
+      n: a.value_error ? esc(a.value_error) : `wallet ${esc((a.wallet || '').slice(0, 10))}…` },
+    { l: 'Open positions', v: fmt.num(pos.length),
+      n: a.positions_error ? esc(a.positions_error) : `${fmt.money(a.positions_value || 0)} at market` },
+    { l: 'Unrealised', v: fmt.signed(a.unrealized_pnl || 0), n: 'on open positions' },
+    { l: 'Trades', v: fmt.num((a.trades || []).length),
+      n: a.trades_error ? esc(a.trades_error) : 'most recent first' },
+  ];
+  $('#account-kpis').innerHTML = kpis.map((k) => `
+    <div class="kpi"><span class="kpi-label">${k.l}</span>
+    <span class="kpi-value">${k.v}</span><span class="kpi-note">${k.n}</span></div>`).join('');
+
+  const pcols = ['Market', 'Outcome', 'Shares', 'Avg', 'Now', 'Value', 'Unrealised'];
+  $('#account-positions').innerHTML = pos.length
+    ? '<thead><tr>' + pcols.map((h) => `<th scope="col">${h}</th>`).join('') + '</tr></thead><tbody>'
+      + pos.map((p) => `<tr>
+          <td>${esc(p.title)}</td><td>${esc(p.outcome)}</td>
+          <td>${fmt.num(p.size, 2)}</td>
+          <td>${p.avg_price == null ? '—' : p.avg_price.toFixed(3)}</td>
+          <td>${p.current_price == null ? '—' : p.current_price.toFixed(3)}</td>
+          <td>${fmt.money(p.value || 0)}</td>
+          <td class="${(p.unrealized_pnl || 0) >= 0 ? 'pos' : 'neg'}">${fmt.signed(p.unrealized_pnl || 0)}</td>
+        </tr>`).join('') + '</tbody>'
+    : '<tbody><tr><td class="live-empty">No open positions.</td></tr></tbody>';
+
+  const tcols = ['Time', 'Side', 'Market', 'Outcome', 'Shares', 'Price', 'Notional'];
+  const trades = (a.trades || []).slice(0, 50);
+  $('#account-trades').innerHTML = trades.length
+    ? '<thead><tr>' + tcols.map((h) => `<th scope="col">${h}</th>`).join('') + '</tr></thead><tbody>'
+      + trades.map((t) => `<tr>
+          <td>${fmt.clock((t.ts || 0) * 1000)}</td>
+          <td class="${t.side === 'BUY' ? 'pos' : 'neg'}">${esc(t.side)}</td>
+          <td>${esc(t.title)}</td><td>${esc(t.outcome)}</td>
+          <td>${fmt.num(t.size, 2)}</td><td>${(t.price || 0).toFixed(3)}</td>
+          <td>${fmt.money(t.usdc || 0)}</td>
+        </tr>`).join('') + '</tbody>'
+    : '<tbody><tr><td class="live-empty">No trades on this wallet yet.</td></tr></tbody>';
+}
+
+async function pollAccount() {
+  try {
+    const a = await fetch('/api/account').then((r) => r.json()).catch(() => null);
+    renderAccount(a);
+  } catch { /* the panel keeps its last render */ }
 }
 
 async function pollBot() {
@@ -318,7 +451,7 @@ function renderPicker() {
   const held = new Set(markets.filter((m) => m.up_shares > 0 || m.down_shares > 0).map((m) => m.slug));
   const slugs = new Set(markets.map((m) => m.slug));
 
-  if (state.selected && !slugs.has(state.selected)) state.selected = null;
+  if (state.selected && !slugs.has(state.selected)) setSelected(null);
 
   // Default to something worth looking at: a market we hold, else the struck
   // current window closest to resolving, else a current window, else next.
@@ -329,10 +462,10 @@ function renderPicker() {
       if (m.secs_left <= WINDOW_S) return [2, m.secs_left];
       return [3, m.secs_left];
     };
-    state.selected = markets.slice().sort((a, b) => {
+    setSelected(markets.slice().sort((a, b) => {
       const ra = rank(a), rb = rank(b);
       return ra[0] - rb[0] || ra[1] - rb[1];
-    })[0].slug;
+    })[0].slug);
   }
 
   // rebuilding eight buttons five times a second is pointless and eats clicks
@@ -350,7 +483,7 @@ function renderPicker() {
     b.innerHTML = `${fmt.mkt(m.slug)}`
       + (m.secs_left > WINDOW_S ? '<span class="pending">next</span>' : '')
       + (held.has(m.slug) ? '<span class="held">held</span>' : '');
-    b.addEventListener('click', () => { state.selected = m.slug; pollLive(); });
+    b.addEventListener('click', () => { setSelected(m.slug); pollLive(); });
     host.appendChild(b);
   });
 }
@@ -1279,6 +1412,8 @@ async function pollHistory() {
 
 pollHistory();
 setInterval(pollHistory, 5000);
+pollAccount();
+setInterval(pollAccount, ACCOUNT_POLL_MS);
 
 /* ═══════════════════════════════ wire up ════════════════════════════════ */
 
@@ -1337,5 +1472,8 @@ applyOverlayLayout();
 
 initTheme();
 poll();
-state.timer = setInterval(pollLive, 100);      // chart cadence
+connectLive();                                 // push transport
+// Fallback only: pollLive() returns immediately while the socket is open, so
+// this costs one function call a tick until the socket is actually gone.
+state.timer = setInterval(pollLive, 250);      // chart cadence (fallback)
 state.botTimer = setInterval(pollBot, 3000);   // process status

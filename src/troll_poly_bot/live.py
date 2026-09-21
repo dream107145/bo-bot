@@ -34,6 +34,7 @@ import contextlib
 import json
 import logging
 import math
+import orjson
 import random
 import statistics
 import time
@@ -529,12 +530,26 @@ class LiveBot:
         for slug in [s for s, m in self.markets.items()
                      if now_ms > m.meta.market.close_ts + (30_000 if m.meta.market.strike <= 0 else 240_000)]:
             lm = self.markets.pop(slug)
+            # Belt and braces. Whatever the reason a window reaches its reaping
+            # still holding risk -- settlement never ran, an exception ate it,
+            # a path added later -- letting it go silently costs a position
+            # slot permanently. Nothing may leave here still on the risk book.
+            if slug in self.risk.open:
+                self._release(slug, lm.meta.market, lm, "reaped unsettled")
             for tid in lm.books:
                 self.token_index.pop(tid, None)
                 self.fees.per_token.pop(tid, None)
             self._subscribed.discard(slug)
             self.engine.features.forget_market(slug)
             self.engine.last.pop(slug, None)
+        # price_history was never pruned here. Each market's deque is capped,
+        # but the number of MARKETS was not: 244 of them and 154k points had
+        # piled up into a 41 MB state file. Writing that takes about a second,
+        # which silently capped the dashboard at 1 Hz no matter what
+        # state_loop's interval said. The closed window is not lost -- it is
+        # already archived to data/charts/ at settlement.
+        for slug in [s for s in self.price_history if s not in self.markets]:
+            self.price_history.pop(slug, None)
 
     async def _fetch_market(self, slug: str) -> dict | None:
         """The market row, None if the venue says it does not exist, or
@@ -1105,18 +1120,13 @@ class LiveBot:
                 self.stats.unresolvable += 1
                 log.warning("%s: no outcome after %d attempts; positions left unsettled",
                             slug, lm.settle_attempts)
-                # The window is over and we will never price it. Say so in the
-                # ledger: without a row here the dashboard has no way to learn
-                # the market ended, and every fill on it reads "open" forever.
-                # pnl is 0.0 because the position is abandoned, not settled --
-                # ``unresolved`` is what distinguishes that from a break-even.
+                # The window is over and we will never price it. Flatten it at
+                # its last mark and hand the risk budget back -- leaving the
+                # position open is what wedged the bot for twenty hours -- and
+                # write the ledger row, without which the dashboard has no way
+                # to learn the market ended and every fill on it reads "open".
                 if had_position:
-                    self._ledger_append({
-                        "ts": self.clock.now(), "event": "settle", "slug": slug,
-                        "asset": m.asset, "epoch": lm.epoch, "strike": m.strike,
-                        "venue_up": None, "ours_up": None, "unresolved": True,
-                        "pnl": 0.0, "balance": round(self.exchange.balance, 4),
-                    })
+                    self._release(slug, m, lm, "no venue outcome")
                 return
         lm.settled = True
         if venue_up is not None and ours_up is not None and venue_up != ours_up:
@@ -1204,6 +1214,57 @@ class LiveBot:
                 fh.write(json.dumps(row) + "\n")
         except OSError:
             log.debug("could not append to trade log")
+
+    def _abandon_position(self, m) -> float:
+        """Flatten an unresolvable window at its last mark. Returns the PnL.
+
+        There is no outcome to settle against, so the position is valued at the
+        last price the book showed. That is the least invented number available:
+        assuming a win overstates equity and assuming a total loss books a loss
+        that probably did not happen. It is still an estimate, which is why the
+        caller keeps it out of the evidence statistic.
+        """
+        total = 0.0
+        for tid in (m.yes_token_id, m.no_token_id):
+            pos = self.exchange.positions.get(tid)
+            if pos is None or abs(pos.shares) <= EXIT_EPS:
+                continue
+            mark = self._mark(tid)
+            mark = 0.0 if mark is None else max(0.0, min(1.0, mark))
+            proceeds = pos.shares * mark
+            total += proceeds - pos.cost_basis - pos.fees_paid
+            self.exchange.balance += proceeds
+            pos.shares = 0.0
+            pos.cost_basis = 0.0
+            pos.fees_paid = 0.0
+        return total
+
+    def _release(self, slug: str, m, lm: LiveMarket | None, why: str) -> None:
+        """Give up on a window: flatten it, free its risk budget, say so.
+
+        The risk budget is the part that matters. A position that is never
+        popped from the risk manager consumes one of `max_concurrent_positions`
+        FOREVER -- ten unresolvable windows in one ten-minute venue outage
+        silently took the bot to its position cap and it bought nothing for the
+        next twenty hours while looking perfectly healthy.
+        """
+        pnl = self._abandon_position(m)
+        self.risk.on_settle(slug, pnl, self.clock.now() / 1000.0)
+        self.stats.realised_pnl += pnl
+        self.pnl_by_asset[m.asset] = self.pnl_by_asset.get(m.asset, 0.0) + pnl
+        if lm is not None:
+            lm.pnl += pnl
+            lm.settled = True
+        # Deliberately NOT counted in wins/losses, stats.settled or epoch_pnl:
+        # a marked-to-market guess is not evidence of edge either way.
+        log.warning("ABANDON %-24s %s  marked %+.2f  balance %.2f",
+                    slug, why, pnl, self.exchange.balance)
+        self._ledger_append({
+            "ts": self.clock.now(), "event": "settle", "slug": slug,
+            "asset": m.asset, "epoch": lm.epoch if lm is not None else 0,
+            "unresolved": True, "reason": why, "marked": True,
+            "pnl": round(pnl, 4), "balance": round(self.exchange.balance, 4),
+        })
 
     def _ledger_append(self, row: dict) -> None:
         """Record one event to disk and to the in-memory tail the dashboard reads."""
@@ -1370,7 +1431,18 @@ class LiveBot:
             await self.clock.resync(samples=3)
 
     def _write_state(self, tmp, snap) -> None:
-        tmp.write_text(json.dumps(snap, separators=(",", ":")), encoding="utf-8")
+        """Serialise and swap in. Atomic, so a reader never sees half a file.
+
+        orjson because this runs ten times a second and is ~8x faster than the
+        stdlib on this payload; OPT_NON_STR_KEYS because epoch_pnl is keyed by
+        int epoch, which json coerces to a string and orjson otherwise refuses.
+        Falls back rather than losing a write if anything unexpected appears.
+        """
+        try:
+            blob = orjson.dumps(snap, option=orjson.OPT_NON_STR_KEYS)
+        except TypeError:
+            blob = json.dumps(snap, separators=(",", ":")).encode()
+        tmp.write_bytes(blob)
         tmp.replace(self.state_path)
 
     async def state_loop(self, every: float = 0.1) -> None:

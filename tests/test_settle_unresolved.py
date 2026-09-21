@@ -12,7 +12,7 @@ import pytest
 
 from troll_poly_bot.live import LiveBot, LiveMarket
 from troll_poly_bot.feeds.markets import MarketMeta
-from troll_poly_bot.types import Market
+from troll_poly_bot.types import Market, Position
 
 SLUG = "btc-updown-5m-1"
 
@@ -45,9 +45,10 @@ async def _none():
     return None
 
 
-class _Pos:
-    def __init__(self, shares):
-        self.shares = shares
+def _Pos(shares, avg=0.40, fees=0.0):
+    """A real Position: abandoning one has to read its cost basis and fees."""
+    return Position(token_id="Y", shares=shares,
+                    cost_basis=shares * avg, fees_paid=fees)
 
 
 @pytest.mark.asyncio
@@ -60,7 +61,7 @@ async def test_unresolvable_window_emits_a_settle_row(tmp_path):
     assert len(rows) == 1, "an abandoned window must still be reported"
     assert rows[0]["slug"] == SLUG
     assert rows[0]["unresolved"] is True
-    assert rows[0]["pnl"] == 0.0, "abandoned, not settled -- no PnL is realised"
+    assert rows[0]["marked"] is True, "the PnL is a mark, not a settlement"
 
 
 @pytest.mark.asyncio
@@ -85,6 +86,67 @@ async def test_window_is_marked_settled_and_counted(tmp_path):
     await _run_unresolvable(bot, lm, shares=10.0)
     assert lm.settled is True
     assert bot.stats.unresolvable == 1
+
+
+@pytest.mark.asyncio
+async def test_the_risk_budget_is_handed_back(tmp_path):
+    """THE bug: a window that never resolves used to hold its slot forever.
+
+    Ten of them in one ten-minute venue outage took the bot to
+    max_concurrent_positions and it bought nothing for the next twenty hours,
+    refusing every trade with RISK_LIMIT while looking perfectly healthy.
+    """
+    bot = _bot(tmp_path)
+    bot.risk.on_fill(SLUG, "BTC", 1, "UP", 4.0, 10.0)
+    assert bot.risk.open, "precondition: we are holding risk on this window"
+
+    await _run_unresolvable(bot, _live_market(), shares=10.0)
+
+    assert SLUG not in bot.risk.open, "the slot must be released"
+    assert bot.risk.exposure_total() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_the_position_is_flattened_at_its_last_mark(tmp_path):
+    bot = _bot(tmp_path)
+    bot._last_mark["Y"] = 0.60
+    before = bot.exchange.balance
+    await _run_unresolvable(bot, _live_market(), shares=10.0)
+
+    pos = bot.exchange.positions["Y"]
+    assert (pos.shares, pos.cost_basis, pos.fees_paid) == (0.0, 0.0, 0.0)
+    # 10 shares marked at 0.60 come back as cash; cost basis was 10 * 0.40
+    assert bot.exchange.balance == pytest.approx(before + 6.0)
+    assert bot.ledger[-1]["pnl"] == pytest.approx(6.0 - 4.0)
+
+
+@pytest.mark.asyncio
+async def test_a_marked_guess_is_kept_out_of_the_evidence_statistic(tmp_path):
+    """epoch_pnl drives the t-stat. An invented number must not reach it."""
+    bot = _bot(tmp_path)
+    bot._last_mark["Y"] = 0.60
+    await _run_unresolvable(bot, _live_market(), shares=10.0)
+    assert bot.epoch_pnl == {}
+    assert (bot.stats.wins, bot.stats.losses, bot.stats.settled) == (0, 0, 0)
+    assert bot.stats.unresolvable == 1
+
+
+@pytest.mark.asyncio
+async def test_reaping_an_unsettled_window_also_releases_it(tmp_path):
+    """The safety net: nothing leaves _reap still on the risk book."""
+    bot = _bot(tmp_path)
+    lm = _live_market()
+    lm.meta.market.close_ts = 0.0                 # long past reaping
+    bot.markets[SLUG] = lm
+    lm.books = {}
+    bot.exchange.positions["Y"] = _Pos(10.0)
+    bot.risk.on_fill(SLUG, "BTC", 1, "UP", 4.0, 10.0)
+
+    bot._reap(now_ms=10_000_000.0)
+
+    assert SLUG not in bot.markets
+    assert SLUG not in bot.risk.open, "reaped while still holding risk"
+    assert bot.ledger[-1]["reason"] == "reaped unsettled"
 
 
 @pytest.mark.asyncio
