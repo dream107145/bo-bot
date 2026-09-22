@@ -57,9 +57,13 @@ def slugs_for_epoch(assets: tuple[str, ...], epoch: int,
     return [(a, slug_for_epoch(a, epoch, duration_min)) for a in assets]
 
 
+SlugFn = Callable[[str, int, int], str]      # (asset, epoch, duration_min) -> slug
+
+
 async def probe_assets(candidates: tuple[str, ...], epoch: int, fetch: Fetch,
                        concurrency: int = 6,
                        duration_min: int = DEFAULT_DURATION_MIN,
+                       slug_fn: SlugFn | None = None,
                        ) -> tuple[dict[str, dict], set[str]]:
     """Return ({asset: gamma_row} for every listed candidate, {assets whose
     probe FAILED and therefore said nothing})."""
@@ -70,7 +74,8 @@ async def probe_assets(candidates: tuple[str, ...], epoch: int, fetch: Fetch,
     async def one(asset: str) -> None:
         async with sem:
             try:
-                row = await fetch(slug_for_epoch(asset, epoch, duration_min))
+                slug = slug_fn(asset, epoch, duration_min) if slug_fn else slug_for_epoch(asset, epoch, duration_min)
+                row = await fetch(slug)
             except FetchFailed:
                 failed.add(asset)
                 return
@@ -106,6 +111,8 @@ class AssetRegistry:
     unresolved: set[str] = field(default_factory=set)         # probe failed last time
     probe_failures: int = 0
     durations: tuple[int, ...] = (DEFAULT_DURATION_MIN,)
+    #: how this venue spells a window's slug; None = Polymarket's
+    slug_fn: SlugFn | None = None
     #: duration (minutes) -> {asset: last gamma row}
     active_by_duration: dict[int, dict[str, dict]] = field(default_factory=dict)
 
@@ -163,7 +170,7 @@ class AssetRegistry:
         per_duration: dict[int, dict[str, dict]] = {}
         for d in durations:
             d_epoch = window_epoch(now_s, duration_min=d)
-            d_found, d_failed = await probe_assets(cands, d_epoch, fetch, duration_min=d)
+            d_found, d_failed = await probe_assets(cands, d_epoch, fetch, duration_min=d, slug_fn=self.slug_fn)
             per_duration[int(d)] = d_found
             failed |= d_failed
             for asset, row in d_found.items():

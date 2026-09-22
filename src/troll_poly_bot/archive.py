@@ -31,7 +31,7 @@ from typing import Any, Iterable
 CHART_DIR = Path("data/charts")
 INDEX_PATH = Path("data/charts_index.json")
 #: A market slug and nothing else -- these values become filenames.
-SLUG_RE = re.compile(r"^[a-z0-9]+-updown-\d+m-\d+$")
+SLUG_RE = re.compile(r"^[a-z0-9]+-(updown-\d+m|up-or-down-\d+-min)-\d+$")   # polymarket | limitless
 INDEX_VERSION = 1
 DEFAULT_PAGE_SIZE = 24
 MAX_PAGE_SIZE = 120

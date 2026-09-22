@@ -119,6 +119,8 @@ def main() -> None:
     ap.add_argument("--durations", default="",
                     help="window lengths to trade, in minutes: 5, 15, or 5,15. "
                          "Default: TPB_WINDOW_MINUTES from .env, else 5")
+    ap.add_argument("--venue", default="", choices=("", "polymarket", "limitless"),
+                    help="where the markets live. Default: TPB_VENUE from .env, else polymarket")
     ap.add_argument("--log-level", default="INFO")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after this many seconds (0 = run until Ctrl+C)")
@@ -137,6 +139,9 @@ def main() -> None:
     # .env first, so TPB_* settings apply in paper mode too -- the window
     # length lives there and the bot is otherwise started with no flags at all.
     cfg = BotConfig.from_env(durations=args.durations)
+    if args.venue:
+        cfg.feeds.venue = args.venue
+    log.info("venue: %s", cfg.feeds.venue)
     log.info("trading %s windows (parameter profile: %sm)",
              ", ".join(f"{d}m" for d in cfg.feeds.durations_min), cfg.feeds.durations_min[0])
     for line in cfg.profile_applied:

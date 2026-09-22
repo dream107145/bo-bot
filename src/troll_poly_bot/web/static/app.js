@@ -36,8 +36,8 @@ const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n
 const DEFAULT_WINDOW_S = 300;
 
 function windowForSlug(slug) {
-  const m = /-updown-(\d+)m-/.exec(String(slug || ''));
-  return m ? Number(m[1]) * 60 : DEFAULT_WINDOW_S;
+  const m = /-updown-(\d+)m-|-up-or-down-(\d+)-min-/.exec(String(slug || ''));
+  return m ? Number(m[1] || m[2]) * 60 : DEFAULT_WINDOW_S;
 }
 
 function windowOf(market) {
@@ -111,7 +111,7 @@ const fmt = {
   // seconds rather than becoming an unreadable 0:06
   dur: (s) => (s < 60 ? `${s < 10 ? s.toFixed(1) : Math.round(s)}s`
     : `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`),
-  mkt: (slug) => (slug || '').replace('-updown-5m-', ' '),
+  mkt: (slug) => (slug || '').replace(/-updown-(\d+)m-/, ' $1m ').replace(/-up-or-down-(\d+)-min-/, ' $1m '),
   mmss: (s) => {
     const t = Math.max(0, Math.round(s));
     return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;

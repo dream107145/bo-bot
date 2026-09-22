@@ -42,15 +42,15 @@ module.exports = {
   apps: [
     {
       ...common,
-      name: 'tpb-web',
+      name: 'bo-web',
       script: PYTHON,
       // bound to all interfaces at the operator's request -- NO AUTH on this API
-      args: '-m troll_poly_bot.web --host 74.208.192.242 --port 8765 --no-browser',
+      args: '-m troll_poly_bot.web --host 74.208.192.242 --port 8766 --no-browser',
       max_memory_restart: '300M',
     },
     {
       ...common,
-      name: 'tpb-bot',
+      name: 'bo-bot',
       script: PYTHON,
       args: '-m troll_poly_bot --balance 100 --assets BTC,ETH,SOL,XRP --log-level INFO',
       max_memory_restart: '600M',

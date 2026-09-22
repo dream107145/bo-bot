@@ -38,6 +38,7 @@ import orjson
 import random
 import statistics
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -53,8 +54,9 @@ from .execution.latency import HOME_BROADBAND, LatencyModel, LatencyProfile
 from .execution.paper import FeeModel, PaperExchange
 from .features.engine import FeatureEngine
 from .features.orderflow import OrderFlowCalibration, OrderFlowState
-from .feeds.markets import MarketMeta, StrikeTracker, parse_market
-from .feeds.polymarket import GAMMA_BASE, duration_tag, window_epoch
+from .feeds.markets import MarketMeta, StrikeTracker
+from .feeds.polymarket import duration_tag, window_epoch
+from .venues import Venue, make_venue
 from .feeds.spot import (
     RECONNECT_MAX_S, RECONNECT_MIN_S, CompositeSpot, FeedStatus, SpotQuote, TradeTick, run_all,
 )
@@ -361,6 +363,7 @@ class Agreement:
 class LiveStats:
     started: float = field(default_factory=time.time)
     windows_seen: int = 0
+    strike_corrections: int = 0   # venue strike differed from our proxy
     windows_traded: int = 0
     settled: int = 0
     wins: int = 0
@@ -382,6 +385,7 @@ class LiveBot:
         reset_history: bool = True,
         exchange=None,
         durations: tuple[int, ...] | None = None,
+        venue: Venue | None = None,
     ) -> None:
         self.cfg = cfg or BotConfig()
         self.cfg.starting_balance = balance
@@ -390,11 +394,26 @@ class LiveBot:
         #: TPB_WINDOW_MINUTES in .env via BotConfig; the default is 5m only.
         self.durations = tuple(durations or self.cfg.feeds.durations_min)
         self.cfg.apply_durations(self.durations)
+        #: where the markets live (TPB_VENUE). Same oracle and pricer either
+        #: way; the venue supplies slugs, rows, books and outcomes.
+        if venue is not None:
+            self.venue = venue
+        elif self.cfg.feeds.venue == "limitless":
+            self.venue = make_venue("limitless", fee_rate=self.cfg.feeds.limitless_fee_rate)
+        else:
+            self.venue = make_venue(self.cfg.feeds.venue)
+        # a venue that holds taker orders before matching adds real latency
+        # to every order; the engine's landing margin must carry it
+        if self.venue.taker_delay_ms > 0.0:
+            self.cfg.engine.latency_safety_margin_ms += self.venue.taker_delay_ms
+        self._rest_feed = "gamma" if self.venue.name == "polymarket" else self.venue.name
+        self._venue_struck: set[str] = set()
         #: empty = trade every asset the venue lists; otherwise a restriction
         self.registry = AssetRegistry(candidates=self.cfg.feeds.candidate_assets,
                                       reprobe_s=self.cfg.feeds.reprobe_s,
                                       pinned=tuple(a.upper() for a in assets),
-                                      durations=self.durations)
+                                      durations=self.durations,
+                                      slug_fn=self.venue.slug)
 
         self.latency = EmpiricalLatency(HOME_BROADBAND, seed=self.cfg.latency_seed)
         if exchange is not None:
@@ -524,12 +543,11 @@ class LiveBot:
                     for a in found:
                         self._ensure_asset(a)
                 for duration in self.durations:
-                    tag = duration_tag(duration)
                     assets = self.registry.assets_for(duration)
                     for offset in (0, 1):
                         ep = window_epoch(now_s, offset, duration)
                         for asset in assets:
-                            slug = f"{asset.lower()}-updown-{tag}-{ep}"
+                            slug = self.venue.slug(asset, ep, duration)
                             if slug in self.markets:
                                 continue
                             row = self.registry.cached_row(slug)
@@ -542,7 +560,7 @@ class LiveBot:
                                     continue
                             if not row:
                                 continue
-                            meta = parse_market(row)
+                            meta = self.venue.parse_market(row)
                             if meta is None:
                                 continue
                             self._ensure_asset(asset)
@@ -560,9 +578,50 @@ class LiveBot:
                                      meta.fee.rate * 100, meta.liquidity)
                             self._resub.set()
                 self._reap(self.clock.now())
+                if self.venue.publishes_strike:
+                    await self._apply_venue_strikes()
             except Exception:
                 log.exception("discovery failed")
-            await asyncio.sleep(20)
+            await asyncio.sleep(20 if not self.venue.publishes_strike else 5)
+
+    async def _apply_venue_strikes(self) -> None:
+        """Take the venue's own strike where it publishes one.
+
+        Our strike is a proxy: the composite spot's 60s TWAP at the open, which
+        is what the Chainlink stream should also print. Where the venue tells
+        us the number it will settle against, that number wins -- a corrected
+        strike is logged with the basis so the proxy's error is measured, not
+        assumed. Only windows that opened in the last ten minutes are asked
+        about; the rest are already right or already gone. A window whose open
+        our own feed missed (a restart mid-window) is recovered the same way:
+        with the venue's strike in hand there is no such thing as a missed open.
+        """
+        now = self.clock.now()
+        want = [s for s, lm in self.markets.items()
+                if s not in self._venue_struck and not lm.settled
+                and lm.meta.market.open_ts <= now < lm.meta.market.close_ts]
+        if not want:
+            return
+        try:
+            hints = await self.venue.strike_hints(self._get_json)
+        except FetchFailed as exc:
+            self.discovery_errors += 1
+            self.last_discovery_error = str(exc)
+            return
+        for slug in want:
+            px = hints.get(slug)
+            if not px:
+                continue
+            meta, before = self.tracker.strike_from_venue(slug, px, now)
+            self._venue_struck.add(slug)
+            if meta is None:
+                continue
+            if before is None:
+                log.info("%s struck at %.6g (venue price to beat)", slug, px)
+            else:
+                bps = (before - px) / px * 1e4
+                self.stats.strike_corrections += 1
+                log.info("%s strike corrected %.6g -> %.6g (venue; proxy was %+.1f bps off)", slug, before, px, bps)
 
     def _reap(self, now_ms: float) -> None:
         for slug in [s for s, m in self.markets.items()
@@ -594,28 +653,31 @@ class LiveBot:
         ``FetchFailed`` if the venue could not be asked. The three answers are
         different: a DNS outage once delisted five assets because the second
         and third were conflated."""
-        url = f"{GAMMA_BASE}/markets?slug={urllib.parse.quote(slug)}"
-        rows, rtt = await self._get_json(url)
-        if rtt is not None:
-            self.latency.record_order(rtt)
-        if isinstance(rows, list) and rows:
-            return rows[0]
-        return None
+        return await self.venue.fetch_market(self._get_json, slug)
 
     async def _get_json(self, url: str) -> tuple[object, float | None]:
         def _do():
-            req = urllib.request.Request(url, headers={"User-Agent": "troll-poly-bot/0.1"})
+            req = urllib.request.Request(url, headers={"User-Agent": "troll-poly-bot/0.1",
+                                                       "Accept": "application/json"})
             t0 = time.perf_counter()
-            with urllib.request.urlopen(req, timeout=12) as r:
-                body = json.load(r)
+            try:
+                with urllib.request.urlopen(req, timeout=12) as r:
+                    body = json.load(r)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    # the venue answered: no such thing. Not a failure.
+                    return None, (time.perf_counter() - t0) * 1000.0
+                raise
             return body, (time.perf_counter() - t0) * 1000.0
         try:
             body, rtt = await asyncio.to_thread(_do)
         except Exception as exc:
             log.debug("GET %s failed: %s", url, exc)
-            self._feed_state("gamma", connected=False, error=f"{type(exc).__name__}: {exc}"[:120])
+            self._feed_state(self._rest_feed, connected=False, error=f"{type(exc).__name__}: {exc}"[:120])
             raise FetchFailed(f"{type(exc).__name__}: {exc}") from exc
-        self._feed_state("gamma", connected=True, message=True)
+        self._feed_state(self._rest_feed, connected=True, message=True)
+        if rtt is not None:
+            self.latency.record_order(rtt)
         return body, rtt
 
     # ─────────────────────────────── feeds ───────────────────────────────
@@ -683,6 +745,42 @@ class LiveBot:
                 local_stop.set()
                 with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     await asyncio.wait_for(asyncio.shield(task), timeout=20.0)
+
+    async def book_feed(self) -> None:
+        if self.venue.book_transport == "websocket":
+            await self.polymarket_feed()
+        else:
+            await self.book_poll_loop()
+
+    async def book_poll_loop(self) -> None:
+        """Books by REST for a venue without a public socket. Every live market
+        whose window is open is asked once per ``poll_s``; one that has not
+        opened yet every fifth round, so its picker chip is not blank."""
+        name = self.venue.name
+        rounds = 0
+        while not self._stop.is_set():
+            rounds += 1
+            now = self.clock.now()
+            live = [lm for lm in self.markets.values() if not lm.settled and now < lm.meta.market.close_ts]
+            due = [lm for lm in live if now >= lm.meta.market.open_ts or rounds % 5 == 0]
+            if not due:
+                await asyncio.sleep(self.venue.poll_s)
+                continue
+            async def one(lm: LiveMarket) -> None:
+                try:
+                    snaps = await self.venue.book_snapshots(self._get_json, lm.meta)
+                except FetchFailed as exc:
+                    self._feed_state(name, connected=False, error=str(exc)[:120])
+                    return
+                got = self.clock.now()
+                for tid, snap in snaps:
+                    book = lm.books.get(tid)
+                    if book is not None:
+                        book.apply_snapshot(snap)
+                self._feed_state(name, connected=True, message=True)
+                self.latency.record_book(max(0.0, got - now))
+            await asyncio.gather(*(one(lm) for lm in due))
+            await asyncio.sleep(self.venue.poll_s)
 
     async def polymarket_feed(self) -> None:
         backoff = RECONNECT_MIN_S
@@ -1230,25 +1328,7 @@ class LiveBot:
             log.debug("could not archive chart for %s", slug)
 
     async def _venue_outcome(self, slug: str) -> bool | None:
-        row = await self._fetch_market(slug)
-        if not row:
-            return None
-        try:
-            outcomes = json.loads(row.get("outcomes") or "[]")
-            prices = [float(p) for p in json.loads(row.get("outcomePrices") or "[]")]
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-        if len(outcomes) != len(prices) or not prices:
-            return None
-        lowered = [str(o).strip().lower() for o in outcomes]
-        if "up" not in lowered:
-            return None
-        p_up = prices[lowered.index("up")]
-        if p_up > 0.9:
-            return True
-        if p_up < 0.1:
-            return False
-        return None
+        return await self.venue.outcome(self._get_json, slug)
 
     # ───────────────────────────── reporting ─────────────────────────────
 
@@ -1427,7 +1507,8 @@ class LiveBot:
             "price_history": {slug: list(pts) for slug, pts in self.price_history.items() if len(pts) >= 2},
             "ledger": self.ledger[-60:],
             "stats": {
-                "windows_seen": self.stats.windows_seen, "windows_traded": self.stats.windows_traded,
+                "windows_seen": self.stats.windows_seen,
+                "strike_corrections": self.stats.strike_corrections, "windows_traded": self.stats.windows_traded,
                 "settled": self.stats.settled, "wins": self.stats.wins, "losses": self.stats.losses,
                 "basis_disagreements": self.stats.basis_disagreements,
                 "unresolvable": self.stats.unresolvable, "realised_pnl": round(self.stats.realised_pnl, 4),
@@ -1480,6 +1561,7 @@ class LiveBot:
                     "sources": {k: round(p, 6) for k, p in v.sources.items()}})(self.composite.view(a, now))
                 for a in self.assets
             },
+            "venue": self.venue.name,
             "exchange_counts": dict(self.composite.counts),
             "twap_coverage_s": {a: round(st.coverage_s(now), 1) for a, st in self.twap.items()},
             "twap60": {a: (lambda v: round(v, 6) if v else None)(st.trailing_twap(now)) for a, st in self.twap.items()},
@@ -1620,7 +1702,7 @@ class LiveBot:
             asyncio.create_task(self.clock_loop()),
             asyncio.create_task(self.discover()),
             asyncio.create_task(self.spot_feed()),
-            asyncio.create_task(self.polymarket_feed()),
+            asyncio.create_task(self.book_feed()),
             asyncio.create_task(self.trade_loop()),
             asyncio.create_task(self.settle_loop()),
             asyncio.create_task(self.state_loop()),

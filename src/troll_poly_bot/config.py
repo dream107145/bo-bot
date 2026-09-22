@@ -85,6 +85,13 @@ class FeedConfig:
     #: and 15m (``TPB_WINDOW_MINUTES`` in .env). The default is 5 so an
     #: unconfigured run behaves exactly as it always has.
     durations_min: tuple[int, ...] = (5,)
+    #: polymarket | limitless (``TPB_VENUE``). Same oracle, same pricer;
+    #: different plumbing. See venues/.
+    venue: str = "polymarket"
+    #: Limitless does not publish its taker fee formula; this is the hump
+    #: coefficient in ``rate * p(1-p)`` (0.12 = 3% at the midpoint). See
+    #: venues/limitless.py, FEE.
+    limitless_fee_rate: float = 0.12
     reprobe_s: float = 1800.0
     max_quote_age_ms: float = 3000.0
     #: Feed the estimators at most this often per asset; three exchanges push
@@ -271,6 +278,8 @@ class BotConfig:
             os.getenv("TPB_STARTING_BALANCE", cfg.starting_balance)
         )
         cfg.log_level = os.getenv("TPB_LOG_LEVEL", cfg.log_level)
+        cfg.feeds.venue = os.getenv("TPB_VENUE", cfg.feeds.venue).strip().lower() or cfg.feeds.venue
+        cfg.feeds.limitless_fee_rate = float(os.getenv("TPB_LIMITLESS_FEE_RATE", cfg.feeds.limitless_fee_rate))
         # TPB_DURATIONS is accepted as an alias; TPB_WINDOW_MINUTES wins.
         spec = os.getenv("TPB_WINDOW_MINUTES") or os.getenv("TPB_DURATIONS")
         source = "TPB_WINDOW_MINUTES"

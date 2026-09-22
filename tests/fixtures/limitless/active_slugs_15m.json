@@ -1,0 +1,14 @@
+[
+ {
+  "slug": "btc-up-or-down-15-min-1790107200",
+  "strikePrice": "86210.31",
+  "ticker": "BTC",
+  "deadline": "2026-09-22T20:15:00.000Z"
+ },
+ {
+  "slug": "eth-up-or-down-15-min-1790107200",
+  "strikePrice": "2750.29",
+  "ticker": "ETH",
+  "deadline": "2026-09-22T20:15:00.000Z"
+ }
+]

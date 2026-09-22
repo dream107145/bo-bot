@@ -215,7 +215,7 @@ def _controls_payload() -> dict:
 
 CHART_DIR = Path("data/charts")
 #: A market slug, and nothing else — this value becomes a filename.
-SLUG_RE = re.compile(r"^[a-z0-9]+-updown-\d+m-\d+$")
+SLUG_RE = re.compile(r"^[a-z0-9]+-(updown-\d+m|up-or-down-\d+-min)-\d+$")   # polymarket | limitless
 MAX_PNG_BYTES = 4 * 1024 * 1024
 MAX_TRADE_ROWS = 1500          # downsample the scatter; the browser gains nothing from 40k
 

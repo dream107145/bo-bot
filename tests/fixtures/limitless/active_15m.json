@@ -1,0 +1,370 @@
+{
+ "data": [
+  {
+   "id": 406807,
+   "automationType": "lumy",
+   "conditionId": "0x1168dfbe5e06cf96d5f05e029311259b20ba404192350a484b3cacb0bf458096",
+   "negRiskRequestId": null,
+   "description": "<p>This market will resolve to \"Up\" if the <a href=\"https://data.chain.link/streams/eth-usd-twap-60s-streams\" target=\"_blank\" rel=\"noopener noreferrer\">Chainlink ETH/USD 60-second TWAP</a> on September 22, 2026, at 20:15 UTC is greater than or equal to the Price to Beat captured from the same TWAP on September 22, 2026, at 20:00 UTC. Otherwise, this market will resolve to \"Down\".</p><p><br></p><p>The <a href=\"https://data.chain.link/streams/eth-usd-twap-60s-streams\" target=\"_blank\" rel=\"noopener noreferrer\">Chainlink ETH/USD 60-second TWAP</a> is used for both the Price to Beat and resolution. Other exchanges, spot markets, and oracles will not be used.</p><p><br></p><p>The report at the exact resolution time is used first. If it is unavailable, the first Chainlink observation within the following 5 seconds will be used. If no report exists in that window, the market will not resolve automatically.</p><p><br></p><p>The Price to Beat captured from the <a href=\"https://data.chain.link/streams/eth-usd-twap-60s-streams\" target=\"_blank\" rel=\"noopener noreferrer\">Chainlink ETH/USD 60-second TWAP</a> on September 22, 2026, at 20:00 UTC was $2750.287281856257196032.</p>",
+   "groupId": null,
+   "collateralToken": {
+    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "decimals": 6,
+    "symbol": "USDC"
+   },
+   "title": "ETH Up or Down - 15 Min",
+   "proxyTitle": null,
+   "expirationDate": "Sep 22, 2026",
+   "expirationTimestamp": 1790108100000,
+   "createdAt": "2026-09-22T19:30:12.725Z",
+   "startAt": "2026-09-22T20:00:00.000Z",
+   "updatedAt": "2026-09-22T20:00:03.430Z",
+   "categories": [
+    "Crypto",
+    "15 min",
+    "Ethereum"
+   ],
+   "status": "FUNDED",
+   "expired": false,
+   "hidden": false,
+   "creator": {
+    "name": "Limitless",
+    "username": "Limitless",
+    "imageURI": "https://limitless.exchange/assets/images/logo.svg",
+    "link": "https://x.com/trylimitless",
+    "address": "0x60e61631d9a585797cDee9f79FafDecf3bd7F64D"
+   },
+   "tags": [
+    "Lumy",
+    "Recurring",
+    "Minutely",
+    "Minutes 15",
+    "challenge_team_crypto",
+    "donut_token_challenge",
+    "challenge_crypto_finance",
+    "challenge_team_finance",
+    "Pareto"
+   ],
+   "volume": "1607000",
+   "volumeFormatted": "1.607000",
+   "tokens": {
+    "yes": "71061237308512964178689102234488375857968028522043848477697062409326918493806",
+    "no": "65921363176802318620216671752029395021349562026204450096240026286362037472279"
+   },
+   "prices": [
+    0.554,
+    0.446
+   ],
+   "tradePrices": {
+    "buy": {
+     "market": [
+      0.6,
+      0.492
+     ],
+     "limit": [
+      0.508,
+      0.4
+     ]
+    },
+    "sell": {
+     "market": [
+      0.508,
+      0.4
+     ],
+     "limit": [
+      0.6,
+      0.492
+     ]
+    }
+   },
+   "isOther": false,
+   "isRewardable": true,
+   "slug": "eth-up-or-down-15-min-1790107200",
+   "stableSlug": "eth-15min-price",
+   "tradeType": "clob",
+   "venue": {
+    "exchange": "0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5",
+    "adapter": null
+   },
+   "marketType": "single",
+   "priorityIndex": 10,
+   "properties": [
+    {
+     "propertyKeySlug": "domain",
+     "value": [
+      "crypto"
+     ]
+    },
+    {
+     "propertyKeySlug": "duration",
+     "value": [
+      "15-min"
+     ]
+    },
+    {
+     "propertyKeySlug": "incentive",
+     "value": [
+      "rebates",
+      "lp-reward"
+     ]
+    },
+    {
+     "propertyKeySlug": "ticker",
+     "value": [
+      "eth"
+     ]
+    }
+   ],
+   "winningOutcomeIndex": null,
+   "metadata": {
+    "c": 3,
+    "fee": true,
+    "hidden": false,
+    "minSize": 50000000,
+    "maxSpread": 0.035,
+    "isBannered": false,
+    "pythLazerId": null,
+    "externalSlug": "eth-updown-15m-1790107200",
+    "rewardsEpoch": 0,
+    "takerDelayMs": 500,
+    "oracleVersion": 1,
+    "isPolyArbitrage": false,
+    "makerRebateMult": 0.3,
+    "minutesDeadline": 15,
+    "rewardsSchedule": null,
+    "externalProvider": "polymarket",
+    "frequencySubType": "minutes_15",
+    "pythLazerChannel": null,
+    "shouldMarketMake": true,
+    "chainlinkDataStream": {
+     "pair": "ETH/USD",
+     "feedId": "0x0002fbf9f58ef89c93385770d289d7c10c01c250641daa811063e303ee095593",
+     "enabled": true,
+     "streamUrl": "https://data.chain.link/streams/eth-usd-twap-60s-streams",
+     "apiBaseUrl": "https://api.dataengine.chain.link",
+     "streamType": "twap",
+     "feedAddress": null,
+     "priceDecimals": 18,
+     "toleranceSeconds": 5,
+     "twapWindowSeconds": 60
+    },
+    "openPriceCapturedAt": "2026-09-22T20:00:00.000Z",
+    "openPriceSelectedAt": "2026-09-22T20:00:00.000Z",
+    "pythProHistorySymbol": null,
+    "pythToleranceSeconds": null,
+    "pythToleranceDirection": null,
+    "openPrice": "2750.287281856257196032"
+   },
+   "settings": {
+    "minSize": "50000000",
+    "maxSpread": 0.035,
+    "dailyReward": "0",
+    "effectiveDailyReward": "0",
+    "currentRewardsMultiplier": 1,
+    "rewardsEpoch": "0",
+    "c": "3",
+    "rebateRate": "0.3",
+    "takerDelayMs": 500,
+    "creatorFeePct": 0
+   },
+   "imageUrl": "https://cdn.limitless.exchange/price-oracles/131/31e8d5aa-90b3-424c-899c-8dbaf3f5d289.png",
+   "logo": "https://cdn.limitless.exchange/price-oracles/131/31e8d5aa-90b3-424c-899c-8dbaf3f5d289.png",
+   "priceOracleMetadata": {
+    "ticker": "ETH",
+    "assetType": "CRYPTO",
+    "pythAddress": "0x0002fbf9f58ef89c93385770d289d7c10c01c250641daa811063e303ee095593",
+    "chartSource": "chainlink",
+    "chainlinkFeedId": "0x0002fbf9f58ef89c93385770d289d7c10c01c250641daa811063e303ee095593",
+    "chainlinkFeedAddress": null,
+    "chainlinkPair": "ETH/USD",
+    "chainlinkStreamUrl": "https://data.chain.link/streams/eth-usd-twap-60s-streams",
+    "symbol": "Crypto.ETH/USD.TWAP60",
+    "name": "ETH TWAP 60s (Chainlink)",
+    "logo": "https://cdn.limitless.exchange/price-oracles/131/31e8d5aa-90b3-424c-899c-8dbaf3f5d289.png"
+   }
+  },
+  {
+   "id": 406806,
+   "automationType": "lumy",
+   "conditionId": "0x1f3630338fcf46917b7b9d4bead18d9493243326fad6392ac31a8c456c949047",
+   "negRiskRequestId": null,
+   "description": "<p>This market will resolve to \"Up\" if the <a href=\"https://data.chain.link/streams/btc-usd-twap-60s-streams\" target=\"_blank\" rel=\"noopener noreferrer\">Chainlink BTC/USD 60-second TWAP</a> on September 22, 2026, at 20:15 UTC is greater than or equal to the Price to Beat captured from the same TWAP on September 22, 2026, at 20:00 UTC. Otherwise, this market will resolve to \"Down\".</p><p><br></p><p>The <a href=\"https://data.chain.link/streams/btc-usd-twap-60s-streams\" target=\"_blank\" rel=\"noopener noreferrer\">Chainlink BTC/USD 60-second TWAP</a> is used for both the Price to Beat and resolution. Other exchanges, spot markets, and oracles will not be used.</p><p><br></p><p>The report at the exact resolution time is used first. If it is unavailable, the first Chainlink observation within the following 5 seconds will be used. If no report exists in that window, the market will not resolve automatically.</p><p><br></p><p>The Price to Beat captured from the <a href=\"https://data.chain.link/streams/btc-usd-twap-60s-streams\" target=\"_blank\" rel=\"noopener noreferrer\">Chainlink BTC/USD 60-second TWAP</a> on September 22, 2026, at 20:00 UTC was $86210.314876447363170304.</p>",
+   "groupId": null,
+   "collateralToken": {
+    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "decimals": 6,
+    "symbol": "USDC"
+   },
+   "title": "BTC Up or Down - 15 Min",
+   "proxyTitle": null,
+   "expirationDate": "Sep 22, 2026",
+   "expirationTimestamp": 1790108100000,
+   "createdAt": "2026-09-22T19:30:11.660Z",
+   "startAt": "2026-09-22T20:00:00.000Z",
+   "updatedAt": "2026-09-22T20:00:03.127Z",
+   "categories": [
+    "Crypto",
+    "Bitcoin",
+    "15 min"
+   ],
+   "status": "FUNDED",
+   "expired": false,
+   "hidden": false,
+   "creator": {
+    "name": "Limitless",
+    "username": "Limitless",
+    "imageURI": "https://limitless.exchange/assets/images/logo.svg",
+    "link": "https://x.com/trylimitless",
+    "address": "0x60e61631d9a585797cDee9f79FafDecf3bd7F64D"
+   },
+   "tags": [
+    "Lumy",
+    "Recurring",
+    "Minutely",
+    "Minutes 15",
+    "challenge_team_crypto",
+    "challenge_crypto_finance",
+    "challenge_team_finance",
+    "Pareto"
+   ],
+   "volume": "8874000",
+   "volumeFormatted": "8.874000",
+   "tokens": {
+    "yes": "92561766575347691682661517223614089895392243646700077548620459710768768509694",
+    "no": "392144576322702972775134155108402495370439619805980035156907947661217933229"
+   },
+   "prices": [
+    0.6825,
+    0.3175
+   ],
+   "tradePrices": {
+    "buy": {
+     "market": [
+      0.71,
+      0.345
+     ],
+     "limit": [
+      0.655,
+      0.29
+     ]
+    },
+    "sell": {
+     "market": [
+      0.655,
+      0.29
+     ],
+     "limit": [
+      0.71,
+      0.345
+     ]
+    }
+   },
+   "isOther": false,
+   "isRewardable": true,
+   "slug": "btc-up-or-down-15-min-1790107200",
+   "stableSlug": "btc-15min-price",
+   "tradeType": "clob",
+   "venue": {
+    "exchange": "0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5",
+    "adapter": null
+   },
+   "marketType": "single",
+   "priorityIndex": 10,
+   "properties": [
+    {
+     "propertyKeySlug": "domain",
+     "value": [
+      "crypto"
+     ]
+    },
+    {
+     "propertyKeySlug": "duration",
+     "value": [
+      "15-min"
+     ]
+    },
+    {
+     "propertyKeySlug": "incentive",
+     "value": [
+      "rebates",
+      "lp-reward"
+     ]
+    },
+    {
+     "propertyKeySlug": "ticker",
+     "value": [
+      "btc"
+     ]
+    }
+   ],
+   "winningOutcomeIndex": null,
+   "metadata": {
+    "c": 3,
+    "fee": true,
+    "hidden": false,
+    "minSize": 50000000,
+    "maxSpread": 0.035,
+    "isBannered": false,
+    "pythLazerId": null,
+    "externalSlug": "btc-updown-15m-1790107200",
+    "rewardsEpoch": 0,
+    "takerDelayMs": 500,
+    "oracleVersion": 1,
+    "isPolyArbitrage": false,
+    "makerRebateMult": 0.3,
+    "minutesDeadline": 15,
+    "rewardsSchedule": null,
+    "externalProvider": "polymarket",
+    "frequencySubType": "minutes_15",
+    "pythLazerChannel": null,
+    "shouldMarketMake": true,
+    "chainlinkDataStream": {
+     "pair": "BTC/USD",
+     "feedId": "0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f",
+     "enabled": true,
+     "streamUrl": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+     "apiBaseUrl": "https://api.dataengine.chain.link",
+     "streamType": "twap",
+     "feedAddress": null,
+     "priceDecimals": 18,
+     "toleranceSeconds": 5,
+     "twapWindowSeconds": 60
+    },
+    "openPriceCapturedAt": "2026-09-22T20:00:00.000Z",
+    "openPriceSelectedAt": "2026-09-22T20:00:00.000Z",
+    "pythProHistorySymbol": null,
+    "pythToleranceSeconds": null,
+    "pythToleranceDirection": null,
+    "openPrice": "86210.314876447363170304"
+   },
+   "settings": {
+    "minSize": "50000000",
+    "maxSpread": 0.035,
+    "dailyReward": "0",
+    "effectiveDailyReward": "0",
+    "currentRewardsMultiplier": 1,
+    "rewardsEpoch": "0",
+    "c": "3",
+    "rebateRate": "0.3",
+    "takerDelayMs": 500,
+    "creatorFeePct": 0
+   },
+   "imageUrl": "https://cdn.limitless.exchange/price-oracles/130/387a1354-5f1e-4fa0-ab44-3bba1fdc6c2c.png",
+   "logo": "https://cdn.limitless.exchange/price-oracles/130/387a1354-5f1e-4fa0-ab44-3bba1fdc6c2c.png",
+   "priceOracleMetadata": {
+    "ticker": "BTC",
+    "assetType": "CRYPTO",
+    "pythAddress": "0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f",
+    "chartSource": "chainlink",
+    "chainlinkFeedId": "0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f",
+    "chainlinkFeedAddress": null,
+    "chainlinkPair": "BTC/USD",
+    "chainlinkStreamUrl": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+    "symbol": "Crypto.BTC/USD.TWAP60",
+    "name": "BTC TWAP 60s (Chainlink)",
+    "logo": "https://cdn.limitless.exchange/price-oracles/130/387a1354-5f1e-4fa0-ab44-3bba1fdc6c2c.png"
+   }
+  }
+ ],
+ "totalMarketsCount": 2
+}

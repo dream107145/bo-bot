@@ -196,6 +196,9 @@ class StrikeTracker:
     _pending: list[MarketMeta] = field(default_factory=list)
     _struck: dict[str, MarketMeta] = field(default_factory=dict)
     _abandoned: int = 0
+    #: windows we could not strike from our own feed, kept so a venue that
+    #: publishes the strike can still hand it to us (Limitless does)
+    _recoverable: dict[str, MarketMeta] = field(default_factory=dict)
 
     def on_price(self, asset: str, price: float, ts: float) -> None:
         self._last_price[asset] = (price, ts)
@@ -217,12 +220,14 @@ class StrikeTracker:
             last = self._last_price.get(meta.market.asset)
             if last is None:
                 self._abandoned += 1
+                self._recoverable[meta.market.slug] = meta
                 log.warning("no oracle price for %s; cannot strike %s",
                             meta.market.asset, meta.market.slug)
                 continue
             price, ts = last
             if abs(meta.market.open_ts - ts) > self.tolerance_ms:
                 self._abandoned += 1
+                self._recoverable[meta.market.slug] = meta
                 log.warning(
                     "oracle price for %s is %.0fms from window open; "
                     "refusing to guess a strike for %s",
@@ -234,6 +239,36 @@ class StrikeTracker:
             newly.append(meta)
         self._pending = still
         return newly
+
+    def strike_from_venue(self, slug: str, price: float, now: float) -> tuple[MarketMeta | None, float | None]:
+        """A strike the VENUE published (Limitless's Price to Beat). Returns
+        (meta, previous strike): the meta if it was struck or corrected by this
+        call, and what our proxy had said if it had already struck it. A window
+        that has not opened is left pending -- the number cannot exist yet."""
+        if price <= 0.0:
+            return None, None
+        meta = self._struck.get(slug)
+        if meta is not None:
+            before = meta.market.strike
+            if abs(before - price) <= 1e-12:
+                return None, None
+            meta.market.strike = price
+            return meta, before
+        for i, meta in enumerate(self._pending):
+            if meta.market.slug == slug:
+                if now < meta.market.open_ts:
+                    return None, None
+                meta.market.strike = price
+                self._struck[slug] = meta
+                del self._pending[i]
+                return meta, None
+        meta = self._recoverable.pop(slug, None)
+        if meta is not None and now < meta.market.close_ts:
+            # our feed missed the open; the venue did not
+            meta.market.strike = price
+            self._struck[slug] = meta
+            return meta, None
+        return None, None
 
     def tradeable(self, now: float) -> list[MarketMeta]:
         return [
@@ -247,6 +282,8 @@ class StrikeTracker:
             if now > m.market.close_ts + grace_ms
         ]:
             del self._struck[slug]
+        for slug in [s for s, m in self._recoverable.items() if now > m.market.close_ts]:
+            del self._recoverable[slug]
 
     @property
     def abandoned_count(self) -> int:

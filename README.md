@@ -56,6 +56,33 @@ Recorder          every window archived to data/charts/<slug>.json with touch, d
 State goes to `data/live_state.json` (dashboard), fills and settlements to
 `data/live_trades.jsonl`, closed windows to `data/charts/`.
 
+## Venue: Polymarket or Limitless
+
+Both venues list 15-minute crypto up/down markets that settle on the **same
+Chainlink 60 s TWAP**, so the composite spot, the strike, the pricer, the fee
+curve shape and the risk book are shared. What differs is the plumbing, and
+that lives in `venues/`:
+
+| | Polymarket | Limitless |
+|---|---|---|
+| slug | `btc-updown-15m-<epoch>` | `btc-up-or-down-15-min-<epoch>` |
+| 15m assets (2026-09-22) | BTC ETH SOL XRP DOGE BNB HYPE | BTC ETH |
+| next window listed ahead | yes | yes (`CREATED`, two ahead) |
+| books | websocket | REST poll, 1/s (socket wants an API key) |
+| strike | our 60 s TWAP proxy at the open | **published** (`strikePrice`), checked against the venue's oracle candles; ours is corrected to it and the basis logged |
+| taker fee | `0.07·p(1-p)`, from the row | not published; `TPB_LIMITLESS_FEE_RATE` (default 0.12 = 3% at the mid) |
+| taker delay | none | 500 ms, added to the landing margin |
+| outcome | `outcomePrices` | `winningOutcomeIndex` (~7 min after close) |
+
+```
+TPB_VENUE=limitless        # or polymarket (the default)
+```
+
+`--venue` overrides it per run. Real-money execution exists for Polymarket
+only; Limitless is **paper-only** until an EIP-712 order signer for Base is
+written. `venues/limitless.py` documents what was verified against the live
+API and the two things that were not (the fee formula, the true minimum size).
+
 ## Window length: 5m and 15m
 
 The venue lists two crypto up/down durations. Probed 2026-09-22, both cover the
