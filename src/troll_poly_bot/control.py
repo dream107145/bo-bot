@@ -119,10 +119,12 @@ TUNABLES: dict[str, Tunable] = {t.key: t for t in (
        help="How many ticks through the ask the limit is placed, to make a fill-or-kill land."),
 
     # ---- when in the window ---------------------------------------------
-    _t("engine.trade_window_start_s", "float", 10.0, 300.0, "Window opens at", "Timing",
+    # Bounds here are validation only (any window the venue could list); the
+    # dashboard gets them scaled to the window actually being traded (spec()).
+    _t("engine.trade_window_start_s", "float", 10.0, 3600.0, "Window opens at", "Timing",
        unit="s left", step=5,
-       help="Seconds remaining when trading may start. 295 is the whole window."),
-    _t("engine.trade_window_end_s", "float", 0.0, 290.0, "Window closes at", "Timing",
+       help="Seconds remaining when trading may start."),
+    _t("engine.trade_window_end_s", "float", 0.0, 3590.0, "Window closes at", "Timing",
        unit="s left", step=5,
        help="Stop this many seconds before resolution. Books go one-sided near the end."),
     _t("engine.max_spot_age_ms", "float", 100.0, 20000.0, "Max spot age", "Timing", unit="ms", step=100,
@@ -152,12 +154,18 @@ TUNABLES: dict[str, Tunable] = {t.key: t for t in (
        help="Cap across every open window of one asset."),
     _t("risk.max_epoch_exposure_usdc", "float", 1.0, 5000.0, "Max per epoch", "Sizing",
        unit="USDC", step=1,
-       help="Cap across all assets sharing a 5-minute window. They are one correlated bet."),
+       help="Cap across all assets sharing a window. They are one correlated bet -- and with "
+            "5m and 15m both running, so are the 5m windows inside a 15m one."),
     _t("risk.max_total_exposure_usdc", "float", 1.0, 10000.0, "Max total open", "Sizing",
        unit="USDC", step=1,
        help="Cap on everything open at once."),
     _t("risk.max_concurrent_positions", "int", 1, 50, "Max open positions", "Sizing", step=1,
        help="How many windows we may be in simultaneously."),
+    _t("risk.max_entries_per_market", "int", 1, 10, "Entries per window", "Sizing", step=1,
+       help="How many times one market may be bought in one window. 1 = once. More lets the bot "
+            "add on the SAME side when every gate passes again, up to the per-market cap."),
+    _t("risk.reentry_cooldown_s", "float", 0.0, 600.0, "Re-entry cooldown", "Sizing", unit="s", step=5,
+       help="Minimum seconds after a fill before the same market may be bought again."),
 
     # ---- when to stop -----------------------------------------------------
     _t("risk.max_daily_loss_usdc", "float", 1.0, 5000.0, "Daily loss limit", "Circuit breakers",
@@ -197,16 +205,39 @@ GROUP_ORDER = ("Edge", "Book filters", "Timing", "Exits", "Sizing",
                "Circuit breakers", "Real-money caps")
 
 
-def spec() -> list[dict[str, Any]]:
-    """The tunable catalogue, as the dashboard renders it."""
+#: How the timing knobs are presented for a window of ``window_s`` seconds:
+#: (upper bound, help). The stored value is always in that window's own
+#: seconds-left, so what the page shows is what the bot compares the clock to.
+def _timing_presentation(window_s: float) -> dict[str, tuple[float, str]]:
+    w = float(window_s)
+    mins = f"{w / 60:g}-minute"
+    return {
+        "engine.trade_window_start_s": (
+            max(w - 5.0, 10.0),
+            f"Seconds remaining when trading may start. {w - 5:g} is the whole {mins} window "
+            f"(5 s after the open); {w / 2:g} would skip its first half."),
+        "engine.trade_window_end_s": (
+            max(w - 10.0, 0.0),
+            f"Stop this many seconds before the {mins} window resolves. Books go one-sided "
+            f"near the end: at 15m over half are already decided with 60-180 s left."),
+    }
+
+
+def spec(window_s: float = 300.0) -> list[dict[str, Any]]:
+    """The tunable catalogue, as the dashboard renders it, for a bot trading
+    windows of ``window_s`` seconds (the timing rows scale with it)."""
+    timing = _timing_presentation(window_s)
     out = []
     for group in GROUP_ORDER:
         for t in TUNABLES.values():
             if t.group != group:
                 continue
-            out.append({"key": t.key, "kind": t.kind, "lo": t.lo, "hi": t.hi, "step": t.step,
-                        "label": t.label, "group": t.group, "unit": t.unit, "help": t.help,
-                        "applies_to": t.applies_to})
+            hi, help_ = t.hi, t.help
+            if t.key in timing:
+                hi, help_ = min(timing[t.key][0], t.hi), timing[t.key][1]
+            out.append({"key": t.key, "kind": t.kind, "lo": t.lo, "hi": hi, "step": t.step,
+                        "label": t.label, "group": t.group, "unit": t.unit, "help": help_,
+                        "applies_to": t.applies_to, "window_s": w if (w := window_s) and t.key in timing else None})
     return out
 
 

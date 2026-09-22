@@ -33,6 +33,8 @@ const common = {
   env: {
     PYTHONUNBUFFERED: '1',      // without this pm2 logs lag behind by a buffer
     TPB_MODE: 'paper',
+    // Window length (5, 15, or 5,15) is NOT set here on purpose: .env owns it,
+    // and load_dotenv() does not override a variable pm2 has already set.
   },
 };
 

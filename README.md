@@ -44,7 +44,7 @@ Feeds             exponential reconnect backoff, per-feed health in the state; a
                   probe keeps an asset instead of delisting it
 Engine            every gate emits a Reason: EDGE_TOO_SMALL, LOW_LIQUIDITY, HIGH_SLIPPAGE,
                   STALE_DATA, DATA_INCONSISTENT, BAD_REGIME, RISK_LIMIT, LOW_CONFIDENCE, ...
-Risk              fractional Kelly x confidence; caps per market, per asset, per 300 s EPOCH
+Risk              fractional Kelly x confidence; caps per market, per asset, per EPOCH
                   (all assets in a window are one bet), total, daily loss, drawdown
 Execution         revalidate against the freshest book, FOK one tick through, never chase
 TakeProfit        sell into the bid once it is 0.05 above our average entry and the
@@ -55,6 +55,80 @@ Recorder          every window archived to data/charts/<slug>.json with touch, d
 
 State goes to `data/live_state.json` (dashboard), fills and settlements to
 `data/live_trades.jsonl`, closed windows to `data/charts/`.
+
+## Window length: 5m and 15m
+
+The venue lists two crypto up/down durations. Probed 2026-09-22, both cover the
+same seven assets (BTC ETH SOL XRP DOGE BNB HYPE) with the same 0.01 tick, the
+same `0.07 * p(1-p)` taker fee and the same Chainlink 60s TWAP oracle; 10m, 30m
+and 1h do not exist.
+
+| | slug | alignment | liquidity (BTC, one sample) |
+|---|---|---|---|
+| 5m | `btc-updown-5m-<epoch>` | 300 s | ~16.5k |
+| 15m | `btc-updown-15m-<epoch>` | 900 s | ~8.3k |
+
+Set it in `.env`:
+
+```
+TPB_WINDOW_MINUTES=5       # the original bot, unchanged (the default)
+TPB_WINDOW_MINUTES=15      # 15-minute windows only
+TPB_WINDOW_MINUTES=5,15    # both at once
+```
+
+or per run with `--durations 15`, which overrides the environment.
+
+**The alignment is not interchangeable.** A 15m window opens on a 900 s
+boundary: 14:45 is a valid open, 14:50 is not. Discovery therefore probes each
+duration at its own epoch, and an asset listed at 5m but not 15m is simply not
+asked for at 15m.
+
+**One knob is reinterpreted, not rescaled.** `trade_window_start_s` reads as
+"wait `300 - start` seconds after the open" rather than as a literal
+seconds-left figure. At 5m the default is unchanged (295 of 300). At 15m it
+becomes 895 of 900 -- taken literally it would have thrown away the first ten
+minutes of every window, which is two thirds of the tradeable time and the part
+where the book is widest. `trade_window_end_s` stays absolute at 60 s: a book
+goes one-sided because expiry is near, which depends on time-to-expiry and not
+on how long the window was.
+
+**Running both durations shares one risk budget.** The per-epoch cap exists
+because everything settling off the same spot path is one bet. With 5m and 15m
+both live, a 15m window and the three 5m windows inside it are bucketed
+together, so `max_epoch_exposure_usdc` still means what it says instead of
+being silently three times looser. With a single duration the bucketing is a
+1:1 relabelling of the old epoch key, so nothing about 5m-only operation moves.
+
+**15m has its own parameters, measured.** A month of 15m history (10,560
+windows, seven assets) was run through the bot's own pricer; the write-up is
+[docs/strategy-15m.md](docs/strategy-15m.md). The short version: the vol
+estimator and the pricer transfer unchanged (the 5m→15m variance ratio is
+0.93–1.00, tails do not matter to the Brier score), the blend still beats the
+market, but the 5m trading knobs do not transfer -- the 5m edge threshold
+lost money at 15m and the +0.05 take-profit gave away ~0.08/share. When the
+primary window is 15m, `DURATION_PROFILES[15]` in `config.py` applies:
+
+| parameter | 5m | 15m |
+|---|---|---|
+| `engine.market_blend` | 0.5 | 0.7 |
+| `engine.min_net_edge` | 0.02 | 0.05 |
+| `engine.trade_window_end_s` | 60 | 120 |
+| `engine.take_profit_enabled` | on | off |
+| `engine.take_profit_min_secs_left` | 10 | 120 |
+| `engine.max_book_age_ms` | 2500 | 5000 |
+| `risk.max_entries_per_market` | 1 | 3 |
+| `risk.reentry_cooldown_s` | 30 | 45 |
+
+The last two are scaling in: at 15m a market already held may be bought
+again when every gate passes afresh -- same side only, at least the cooldown
+after the previous fill, never past `max_position_usdc` in total, and never
+after a stop closed the window. At 5m it stays one entry per window. These
+two are judgment, not measured: the study cannot see fills.
+
+The profile is applied once at startup, before CLI flags and before the
+dashboard's control file, so anything you set still wins. Expect far fewer
+trades than at 5m. Still paper-only: the study assumes a 0.02 spread it could
+not see -- the live `HIGH_SLIPPAGE` / `LOW_LIQUIDITY` counters are the check.
 
 ## The one thing to understand first
 

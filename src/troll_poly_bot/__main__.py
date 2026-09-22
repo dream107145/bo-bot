@@ -24,10 +24,10 @@ import sys
 from .config import BotConfig
 from .live import LiveBot
 
+log = logging.getLogger(__name__)
+
 
 def _build_live_exchange(args, cfg: BotConfig):
-    from dotenv import load_dotenv
-    load_dotenv()
     logging.getLogger("httpx").setLevel(logging.WARNING)      # the SDK logs every request at INFO
     from .execution.paper import FeeModel
     from .execution.polymarket import (
@@ -82,6 +82,8 @@ def _build_live_exchange(args, cfg: BotConfig):
 
 
 def main() -> None:
+    from dotenv import load_dotenv
+
     ap = argparse.ArgumentParser(description="troll-poly-bot: paper by default, real account with --live")
     ap.add_argument("--balance", type=float, default=100.0,
                     help="paper: starting balance. live: the bankroll the risk caps scale to "
@@ -114,10 +116,17 @@ def main() -> None:
     ap.add_argument("--max-orders-per-hour", type=int, default=60)
     ap.add_argument("--kill-file", default="data/KILL",
                     help="live: create this file and no further order is sent")
+    ap.add_argument("--durations", default="",
+                    help="window lengths to trade, in minutes: 5, 15, or 5,15. "
+                         "Default: TPB_WINDOW_MINUTES from .env, else 5")
     ap.add_argument("--log-level", default="INFO")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after this many seconds (0 = run until Ctrl+C)")
     args = ap.parse_args()
+
+    # Before anything reads TPB_*: the window length, the latency profile and
+    # the live credentials all come from here.
+    load_dotenv()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -125,7 +134,13 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    cfg = BotConfig()
+    # .env first, so TPB_* settings apply in paper mode too -- the window
+    # length lives there and the bot is otherwise started with no flags at all.
+    cfg = BotConfig.from_env(durations=args.durations)
+    log.info("trading %s windows (parameter profile: %sm)",
+             ", ".join(f"{d}m" for d in cfg.feeds.durations_min), cfg.feeds.durations_min[0])
+    for line in cfg.profile_applied:
+        log.info("  profile  %s", line)
     cfg.scale_risk_to_balance(args.balance)
     if args.min_edge is not None:
         cfg.engine.min_net_edge = args.min_edge
@@ -144,7 +159,9 @@ def main() -> None:
     if args.live:
         exchange = _build_live_exchange(args, cfg)
         # the risk caps scale to the bankroll the account can actually fund
-        cfg = BotConfig(engine=cfg.engine, mode="live")
+        # a fresh config so the risk caps scale from defaults, but the engine
+        # and the feed settings (window lengths above all) are carried over
+        cfg = BotConfig(engine=cfg.engine, feeds=cfg.feeds, mode="live")
         cfg.live.armed = bool(args.armed)
         cfg.scale_risk_to_balance(exchange.bankroll)
         if args.min_edge is not None:
@@ -159,6 +176,7 @@ def main() -> None:
         exchanges=tuple(e.strip().lower() for e in args.exchanges.split(",") if e.strip()),
         reset_history=(not args.keep_history) and exchange is None,
         exchange=exchange,
+        durations=cfg.feeds.durations_min,
     )
 
     async def runner() -> None:

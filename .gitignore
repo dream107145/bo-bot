@@ -18,3 +18,5 @@ data/research/
 data/KILL
 data/controls.json
 data/charts_index.json
+# server/smoke run logs written by this checkout
+logs/

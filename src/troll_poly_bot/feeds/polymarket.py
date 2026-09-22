@@ -36,20 +36,52 @@ log = logging.getLogger(__name__)
 CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-#: Polymarket 5m crypto up/down windows are aligned to 300s UTC boundaries and
-#: the slug carries the window START. Discovery is therefore deterministic --
-#: no listing endpoint, no pagination. (The Gamma listing endpoint was observed
-#: returning months-old rows for `order=endDate&ascending=true`, so constructing
-#: the slug is both cheaper and more reliable.)
+#: Polymarket crypto up/down windows are aligned to UTC boundaries of their own
+#: duration and the slug carries the window START. Discovery is therefore
+#: deterministic -- no listing endpoint, no pagination. (The Gamma listing
+#: endpoint was observed returning months-old rows for
+#: `order=endDate&ascending=true`, so constructing the slug is both cheaper and
+#: more reliable.)
+#:
+#: The default stays 5 minutes: every caller that predates the 15m markets gets
+#: exactly the behaviour it had.
 WINDOW_S = 300
 
+#: Durations the venue lists, probed 2026-09-22: `btc-updown-5m-<epoch/300>`
+#: and `btc-updown-15m-<epoch/900>`, same 60s TWAP oracle, same 0.01 tick, same
+#: fee schedule, roughly half the liquidity at 15m. 10m/30m/1h do not exist.
+#: Nothing here hard-codes the list -- it is a default, and an unlisted slug
+#: simply returns no row.
+SUPPORTED_DURATIONS_MIN: tuple[int, ...] = (5, 15)
 
-def window_epoch(now_s: float, offset_windows: int = 0) -> int:
-    return int(now_s) // WINDOW_S * WINDOW_S + offset_windows * WINDOW_S
+DEFAULT_DURATION_MIN = 5
 
 
-def slug_for(asset: str, now_s: float, offset_windows: int = 0) -> str:
-    return f"{asset.lower()}-updown-5m-{window_epoch(now_s, offset_windows)}"
+def window_seconds(duration_min: int = DEFAULT_DURATION_MIN) -> int:
+    """Window length in seconds. Also the UTC alignment of its start."""
+    return int(duration_min) * 60
+
+
+def window_epoch(now_s: float, offset_windows: int = 0,
+                 duration_min: int = DEFAULT_DURATION_MIN) -> int:
+    """Start epoch of the window containing ``now_s``, ``offset_windows`` ahead.
+
+    A 15m window is aligned to 900s, not to three 5m windows: 14:45 is a valid
+    15m open, 14:50 is not.
+    """
+    w = window_seconds(duration_min)
+    return int(now_s) // w * w + offset_windows * w
+
+
+def duration_tag(duration_min: int = DEFAULT_DURATION_MIN) -> str:
+    """The `5m` / `15m` fragment of a slug."""
+    return f"{int(duration_min)}m"
+
+
+def slug_for(asset: str, now_s: float, offset_windows: int = 0,
+             duration_min: int = DEFAULT_DURATION_MIN) -> str:
+    epoch = window_epoch(now_s, offset_windows, duration_min)
+    return f"{asset.lower()}-updown-{duration_tag(duration_min)}-{epoch}"
 
 
 def parse_book(payload: dict, token_id: str | None = None) -> OrderBook:

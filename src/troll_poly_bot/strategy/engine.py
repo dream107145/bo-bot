@@ -48,6 +48,16 @@ from ..types import Order, OrderBook, Side, TimeInForce
 log = logging.getLogger(__name__)
 
 
+def window_start_s(cfg: "EngineConfig", window_s: float) -> float:
+    """Seconds-left at which trading may start in a window of ``window_s``.
+
+    Preserves the tuned 5m value exactly (295.0 of a 300s window) and carries
+    the same "wait N seconds after the open" intent to any other duration.
+    """
+    delay = max(cfg.window_reference_s - cfg.trade_window_start_s, 0.0)
+    return max(min(window_s - delay, window_s), 0.0)
+
+
 class Reason(str, Enum):
     OUTSIDE_TIME_WINDOW = "OUTSIDE_TIME_WINDOW"
     CANNOT_LAND_IN_TIME = "CANNOT_LAND_IN_TIME"
@@ -77,6 +87,20 @@ class EngineConfig:
     trade_window_start_s: float = 295.0
     trade_window_end_s: float = 60.0
     latency_safety_margin_ms: float = 500.0
+    #: The window length the two knobs above are expressed in: the PRIMARY
+    #: duration being traded (BotConfig.apply_durations sets it). They are read as
+    #: "skip the first ``window_reference_s - trade_window_start_s`` seconds
+    #: after the open, and stop ``trade_window_end_s`` before the close", so a
+    #: longer window inherits both intents instead of the raw numbers: at 15m
+    #: the start would otherwise sit at 295s left and throw away the first ten
+    #: minutes of every window. The END stays absolute on purpose -- a book
+    #: goes one-sided because the outcome is nearly decided, which is a
+    #: function of time-to-expiry, not of how long the window was.
+    window_reference_s: float = 300.0
+    #: Seconds per correlated-exposure bucket for the per-epoch risk cap. See
+    #: ``BotConfig.apply_durations``: one duration makes this a relabelling of
+    #: the window start; mixed durations make overlapping windows one bet.
+    correlation_bucket_s: float = 300.0
 
     # --- data quality ----------------------------------------------------
     max_spot_age_ms: float = 1500.0
@@ -295,6 +319,19 @@ class StrategyEngine:
 
     # --------------------------------------------------------------- helpers
 
+    def correlation_epoch(self, open_ts_ms: float) -> int:
+        """The risk bucket a window belongs to.
+
+        The per-epoch cap exists because everything resolving off the same spot
+        path is one bet. With a single duration this is the window's own start
+        (bucketing 300s-aligned opens by 300s is a relabelling, so grouping is
+        unchanged); with 5m and 15m both live it puts a 15m window and the
+        three 5m windows inside it in the same bucket, which is what they are.
+        """
+        start_s = int(open_ts_ms // 1000)
+        bucket = int(self.cfg.correlation_bucket_s)
+        return start_s // bucket if bucket > 0 else start_s
+
     def _reject(self, ev: Evaluation, reason: Reason, detail: str = "") -> Evaluation:
         ev.reason, ev.detail = reason, detail
         self.rejections[reason.value] = self.rejections.get(reason.value, 0) + 1
@@ -326,7 +363,11 @@ class StrategyEngine:
         left = m.seconds_remaining(now)
         ev = Evaluation(slug=m.slug, asset=m.asset, seconds_left=left, reason=None)
 
-        if not (cfg.trade_window_end_s <= left <= cfg.trade_window_start_s):
+        # The horizon comes from the market, never from a constant: a 5m and a
+        # 15m window are the same code path with a different window_s.
+        window_s = max((m.close_ts - m.open_ts) / 1000.0, 0.0)
+        start_s = window_start_s(cfg, window_s) if window_s > 0.0 else cfg.trade_window_start_s
+        if not (cfg.trade_window_end_s <= left <= start_s):
             return self._reject(ev, Reason.OUTSIDE_TIME_WINDOW)
         need_ms = latency.round_trip_ms() + cfg.latency_safety_margin_ms
         if left * 1000.0 < need_ms:
@@ -375,7 +416,7 @@ class StrategyEngine:
         ua = book_up.best_ask if book_up is not None else None
         feats = self.features.features(
             asset=m.asset, slug=m.slug, strike=m.strike, spot=spot.price, now_ms=now,
-            seconds_left=left, window_s=(m.close_ts - m.open_ts) / 1000.0,
+            seconds_left=left, window_s=window_s,
             up_price=mid_up, up_bid=ub, up_ask=ua, sigma_per_sec=vol.sigma_per_sec,
             model_p_up=fv.p_up, model_z=fv.z, extra=of,
         )
@@ -439,16 +480,25 @@ class StrategyEngine:
         # --- risk and size ----------------------------------------------------
         cb = best.costs
         confidence = cb.net_edge / (cb.net_edge + fv.uncertainty) if cb.net_edge + fv.uncertainty > 0 else 0.0
-        epoch = int(m.open_ts // 1000)
+        epoch = self.correlation_epoch(m.open_ts)
+        # A market we already hold is answered BEFORE sizing: whether another
+        # entry is allowed at all (entries left, same side, cooldown) is a
+        # different answer from "there was no room to size one", and the
+        # dashboard should say which.
+        if m.slug in self.risk.open:
+            held = self.risk.check(m.slug, m.asset, epoch, 0.0, side=best.side, now_s=now / 1000.0)
+            if not held.ok:
+                return self._reject(ev, Reason(held.reason), held.detail)
         limit = min(1.0 - m.tick_size, round(best.ask + cfg.cross_ticks * m.tick_size, 4))
         shares, note = self.risk.size(
             p=best.p_model, price=best.ask, confidence=confidence, balance=balance,
             asset=m.asset, epoch=epoch, side=best.side, available_shares=best.depth_at_limit,
-            min_size=m.min_size,
+            min_size=m.min_size, slug=m.slug,
         )
         if shares <= 0.0:
             return self._reject(ev, Reason.SIZE_ZERO, note)
-        verdict = self.risk.check(m.slug, m.asset, epoch, shares * best.ask)
+        verdict = self.risk.check(m.slug, m.asset, epoch, shares * best.ask,
+                                  side=best.side, now_s=now / 1000.0)
         if not verdict.ok:
             return self._reject(ev, Reason(verdict.reason), verdict.detail)
 

@@ -54,7 +54,7 @@ from .execution.paper import FeeModel, PaperExchange
 from .features.engine import FeatureEngine
 from .features.orderflow import OrderFlowCalibration, OrderFlowState
 from .feeds.markets import MarketMeta, StrikeTracker, parse_market
-from .feeds.polymarket import GAMMA_BASE, window_epoch
+from .feeds.polymarket import GAMMA_BASE, duration_tag, window_epoch
 from .feeds.spot import (
     RECONNECT_MAX_S, RECONNECT_MIN_S, CompositeSpot, FeedStatus, SpotQuote, TradeTick, run_all,
 )
@@ -315,7 +315,10 @@ class Agreement:
     sum_abs: float = 0.0
     sum_sq: float = 0.0
     buckets: dict = field(default_factory=dict)
-    EDGES = (300.0, 150.0, 90.0, 60.0, 40.0, 25.0, 15.0, 8.0, 0.0)
+    #: Extended past 300s for the 15m windows. A 5m market never reports more
+    #: than 300s left, so its buckets are untouched and the two durations stay
+    #: comparable in the buckets they share.
+    EDGES = (900.0, 600.0, 450.0, 300.0, 150.0, 90.0, 60.0, 40.0, 25.0, 15.0, 8.0, 0.0)
 
     @classmethod
     def bucket_of(cls, secs_left: float) -> str:
@@ -378,14 +381,20 @@ class LiveBot:
         exchanges: tuple[str, ...] | None = None,
         reset_history: bool = True,
         exchange=None,
+        durations: tuple[int, ...] | None = None,
     ) -> None:
         self.cfg = cfg or BotConfig()
         self.cfg.starting_balance = balance
         self.exchanges = tuple(exchanges or self.cfg.feeds.exchanges)
+        #: Window lengths to trade, in minutes (5, 15, or both). Set from
+        #: TPB_WINDOW_MINUTES in .env via BotConfig; the default is 5m only.
+        self.durations = tuple(durations or self.cfg.feeds.durations_min)
+        self.cfg.apply_durations(self.durations)
         #: empty = trade every asset the venue lists; otherwise a restriction
         self.registry = AssetRegistry(candidates=self.cfg.feeds.candidate_assets,
                                       reprobe_s=self.cfg.feeds.reprobe_s,
-                                      pinned=tuple(a.upper() for a in assets))
+                                      pinned=tuple(a.upper() for a in assets),
+                                      durations=self.durations)
 
         self.latency = EmpiricalLatency(HOME_BROADBAND, seed=self.cfg.latency_seed)
         if exchange is not None:
@@ -500,7 +509,13 @@ class LiveBot:
     # ───────────────────────────── discovery ─────────────────────────────
 
     async def discover(self) -> None:
-        """Probe which assets are listed, then construct current + next slugs."""
+        """Probe which assets are listed, then construct current + next slugs.
+
+        Each configured duration is walked at its own UTC alignment: 15m
+        windows open on 900s boundaries, 5m ones on 300s boundaries, so a
+        single epoch cannot serve both. Everything after this point is
+        duration-agnostic -- the market carries its own open/close.
+        """
         while not self._stop.is_set():
             try:
                 now_s = self.clock.now() / 1000.0
@@ -508,39 +523,42 @@ class LiveBot:
                     found = await self.registry.refresh(self._fetch_market, now_s)
                     for a in found:
                         self._ensure_asset(a)
-                epoch_now = window_epoch(now_s)
-                for offset in (0, 1):
-                    ep = window_epoch(now_s, offset)
-                    for asset in self.registry.assets:
-                        slug = f"{asset.lower()}-updown-5m-{ep}"
-                        if slug in self.markets:
-                            continue
-                        row = self.registry.active.get(asset) if ep == epoch_now else None
-                        if not row or row.get("slug") != slug:
-                            try:
-                                row = await self._fetch_market(slug)
-                            except FetchFailed as exc:
-                                self.discovery_errors += 1
-                                self.last_discovery_error = str(exc)
+                for duration in self.durations:
+                    tag = duration_tag(duration)
+                    assets = self.registry.assets_for(duration)
+                    for offset in (0, 1):
+                        ep = window_epoch(now_s, offset, duration)
+                        for asset in assets:
+                            slug = f"{asset.lower()}-updown-{tag}-{ep}"
+                            if slug in self.markets:
                                 continue
-                        if not row:
-                            continue
-                        meta = parse_market(row)
-                        if meta is None:
-                            continue
-                        self._ensure_asset(asset)
-                        lm = LiveMarket(meta=meta)
-                        for tid in (meta.market.yes_token_id, meta.market.no_token_id):
-                            lm.books[tid] = LiveBook(tid)
-                            self.token_index[tid] = (slug, lm)
-                            self.fees.set_token_schedule(tid, meta.fee)
-                        self.markets[slug] = lm
-                        self.tracker.register(meta)
-                        self.stats.windows_seen += 1
-                        log.info("discovered %-26s closes %s  fee %.0f%%  liq %.0f",
-                                 slug, time.strftime("%H:%M:%S", time.gmtime(meta.market.close_ts / 1000)),
-                                 meta.fee.rate * 100, meta.liquidity)
-                        self._resub.set()
+                            row = self.registry.cached_row(slug)
+                            if not row:
+                                try:
+                                    row = await self._fetch_market(slug)
+                                except FetchFailed as exc:
+                                    self.discovery_errors += 1
+                                    self.last_discovery_error = str(exc)
+                                    continue
+                            if not row:
+                                continue
+                            meta = parse_market(row)
+                            if meta is None:
+                                continue
+                            self._ensure_asset(asset)
+                            lm = LiveMarket(meta=meta)
+                            for tid in (meta.market.yes_token_id, meta.market.no_token_id):
+                                lm.books[tid] = LiveBook(tid)
+                                self.token_index[tid] = (slug, lm)
+                                self.fees.set_token_schedule(tid, meta.fee)
+                            self.markets[slug] = lm
+                            self.tracker.register(meta)
+                            self.stats.windows_seen += 1
+                            log.info("discovered %-28s closes %s  fee %.0f%%  liq %.0f",
+                                     slug,
+                                     time.strftime("%H:%M:%S", time.gmtime(meta.market.close_ts / 1000)),
+                                     meta.fee.rate * 100, meta.liquidity)
+                            self._resub.set()
                 self._reap(self.clock.now())
             except Exception:
                 log.exception("discovery failed")
@@ -1199,6 +1217,8 @@ class LiveBot:
             (self.chart_dir / f"{slug}.json").write_text(json.dumps({
                 "slug": slug, "asset": m.asset, "strike": m.strike,
                 "open_ts": m.open_ts, "close_ts": m.close_ts,
+                # the console plots a saved window on its own time axis
+                "window_s": round(lm.meta.duration_s, 1),
                 "outcome": "UP" if won_up else "DOWN",
                 "outcome_source": "venue" if venue_up is not None else "proxy",
                 "pnl": round(pnl, 4), "fills": fills,
@@ -1382,6 +1402,10 @@ class LiveBot:
                 {
                     "slug": s, "asset": lm.meta.market.asset, "strike": lm.meta.market.strike,
                     "secs_left": round(lm.meta.market.seconds_remaining(now), 1),
+                    # the console's time axis is this window wide; it must come
+                    # from the market, not from a 300 baked into the front end
+                    "window_s": round(lm.meta.duration_s, 1),
+                    "open_ts": lm.meta.market.open_ts, "close_ts": lm.meta.market.close_ts,
                     "submitted": lm.submitted, "fee_rate": lm.meta.fee.rate,
                     "status": self._market_status(lm, now),
                     "liquidity": round(lm.meta.liquidity, 0),
@@ -1440,6 +1464,7 @@ class LiveBot:
                 "stop_loss": (self.cfg.engine.stop_loss_delta
                               if self.cfg.engine.stop_loss_enabled else 0.0),
                 "trade_window_s": [self.cfg.engine.trade_window_start_s, self.cfg.engine.trade_window_end_s],
+                "window_s": self.cfg.engine.window_reference_s,
             },
             "controls": {
                 "scope": self.control_scope,

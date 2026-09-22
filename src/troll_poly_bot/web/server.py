@@ -186,11 +186,24 @@ CONTROLS = control.ControlFile()
 ARCHIVE = archive.ArchiveIndex()
 
 
+def _primary_window_s() -> float:
+    """The window length the running bot trades, from its state file; 300 if
+    no bot has written one. Only the timing rows of the catalogue depend on it."""
+    try:
+        gates = json.loads(Path("data/live_state.json").read_text(encoding="utf-8")).get("gates") or {}
+        w = float(gates.get("window_s") or 0.0)
+        return w if w > 0 else 300.0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 300.0
+
+
 def _controls_payload() -> dict:
     """The catalogue, what is stored per scope, and the kill switch."""
     stored = CONTROLS.read()
+    window_s = _primary_window_s()
     return {
-        "spec": control.spec(),
+        "spec": control.spec(window_s),
+        "window_s": window_s,
         "start_args": control.START_ARGS,
         "scopes": list(control.SCOPES),
         "stored": {s: stored.get(s) or {} for s in control.SCOPES},
@@ -362,6 +375,9 @@ class BotController:
         "balance": ("--balance", "num"),
         "assets": ("--assets", "text"),
         "exchanges": ("--exchanges", "text"),
+        # window lengths in minutes ("5", "15", "5,15"). Unset, the child
+        # inherits TPB_WINDOW_MINUTES from .env like any other setting.
+        "durations": ("--durations", "text"),
         "min_edge": ("--min-edge", "num"),
         "blend": ("--blend", "num"),
         "take_profit": ("--take-profit", "num"),

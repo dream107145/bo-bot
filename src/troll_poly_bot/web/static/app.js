@@ -26,7 +26,30 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
-const WINDOW_S = 300;           // a market is five minutes; the axis is fixed to it
+/* A market's length comes from the market. The venue lists 5m and 15m windows
+   and the bot can run either or both, so a constant here silently broke the
+   console at 15m: the picker filtered every market out (753s left is not
+   <= 2 * 300), nothing was selected, and with nothing selected the server
+   sends no price history at all -- no chart, no spot price. The backend
+   publishes `window_s` per market; the slug is the fallback for a payload
+   written before it did. */
+const DEFAULT_WINDOW_S = 300;
+
+function windowForSlug(slug) {
+  const m = /-updown-(\d+)m-/.exec(String(slug || ''));
+  return m ? Number(m[1]) * 60 : DEFAULT_WINDOW_S;
+}
+
+function windowOf(market) {
+  if (market && Number(market.window_s) > 0) return Number(market.window_s);
+  return windowForSlug(market && market.slug);
+}
+
+/* The window of the market the chart is drawing. */
+function selectedWindowS(slug = state.selected) {
+  const m = (state.live.live_markets || []).find((x) => x.slug === slug);
+  return m ? windowOf(m) : windowForSlug(slug);
+}
 
 const state = {
   live: null,
@@ -63,6 +86,18 @@ function applyOverlayLayout() {
 }
 
 const fmt = {
+  /* "15:45:00 – 16:00:00": a window's open and close on the UTC clock, from
+     the bot's own timestamps. Falls back to the clock + seconds-left for a
+     payload written before the bot published them. */
+  window: (m) => {
+    const hms = (ms) => new Date(ms).toISOString().slice(11, 19);
+    if (m && m.open_ts && m.close_ts) return `${hms(m.open_ts)} – ${hms(m.close_ts)}`;
+    if (m && m.secs_left != null) {
+      const close = Date.now() + m.secs_left * 1000, win = (Number(m.window_s) || 300) * 1000;
+      return `${hms(close - win)} – ${hms(close)}`;
+    }
+    return '—';
+  },
   money: (v) => (v < 0 ? '-' : '') + '$' + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 2 }),
   signed: (v) => (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 2 }),
   pct: (v) => (v * 100).toFixed(1) + '%',
@@ -417,37 +452,51 @@ function legend(host, items) {
   });
 }
 
-/* ═══════════════════════════ the fixed 5m axis ══════════════════════════ */
+/* ═════════════════════ the fixed axis, one window wide ══════════════════ */
 
 /* x is elapsed time into the window, not sample index. Mapping x to the
    sample index made every new point recompress the whole line leftward; a
-   fixed 0..300s domain lets the line grow rightward and stay put. Points
+   fixed 0..window domain lets the line grow rightward and stay put. Points
    before the open are not drawn; post-close samples (left clamps to 0) sit at
-   the right edge. */
+   the right edge.
 
-const elapsedOf = (p) => WINDOW_S - Math.max(0, Math.min(WINDOW_S, p.left));
-const inWindow = (p) => p.left <= WINDOW_S;
+   `win` is the window length in seconds -- 300 or 900. It defaults to the
+   selected market's so a caller that draws the current chart need not pass it,
+   but the offscreen export of a CLOSED market must, because that market is no
+   longer the selected one. */
 
-function fixedAxis(svg, m, pw, H) {
-  const X = (p) => m.l + (elapsedOf(p) / WINDOW_S) * pw;
-  const Xe = (elapsed) => m.l + (elapsed / WINDOW_S) * pw;
+const elapsedOf = (p, win = selectedWindowS()) =>
+  win - Math.max(0, Math.min(win, p.left));
+const inWindow = (p, win = selectedWindowS()) => p.left <= win;
+
+/* Tick every minute at 5m, every three at 15m: six labels either way. */
+function axisStepS(win) {
+  return win <= 360 ? 60 : Math.round(win / 5 / 60) * 60;
+}
+
+function fixedAxis(svg, m, pw, H, win = selectedWindowS()) {
+  const X = (p) => m.l + (elapsedOf(p, win) / win) * pw;
+  const Xe = (elapsed) => m.l + (elapsed / win) * pw;
   svg.appendChild(el('line', { class: 'axis-line', x1: m.l, x2: m.l + pw, y1: m.t + (H - m.t - m.b), y2: m.t + (H - m.t - m.b) }));
-  for (let k = 0; k <= 5; k++) {
-    const lab = el('text', { class: 'axis-text', x: Xe(k * 60), y: H - 12,
-      'text-anchor': k === 0 ? 'start' : k === 5 ? 'end' : 'middle' });
-    lab.textContent = fmt.mmss(WINDOW_S - k * 60);
+  const step = axisStepS(win);
+  for (let k = 0; k * step <= win + 1e-6; k++) {
+    const at = k * step;
+    const last = at + step > win + 1e-6;
+    const lab = el('text', { class: 'axis-text', x: Xe(at), y: H - 12,
+      'text-anchor': k === 0 ? 'start' : last ? 'end' : 'middle' });
+    lab.textContent = fmt.mmss(win - at);
     svg.appendChild(lab);
   }
   return { X, Xe };
 }
 
 /* nearest drawn point to a mouse x, by elapsed time */
-function nearestByX(pts, ev, svg, m, pw) {
+function nearestByX(pts, ev, svg, m, pw, win = selectedWindowS()) {
   const bx = svg.getBoundingClientRect();
-  const elapsed = Math.max(0, Math.min(WINDOW_S, ((ev.clientX - bx.left - m.l) / (pw || 1)) * WINDOW_S));
+  const elapsed = Math.max(0, Math.min(win, ((ev.clientX - bx.left - m.l) / (pw || 1)) * win));
   let best = null, bd = Infinity;
   for (const p of pts) {
-    const d = Math.abs(elapsedOf(p) - elapsed);
+    const d = Math.abs(elapsedOf(p, win) - elapsed);
     if (d < bd) { bd = d; best = p; }
   }
   return best;
@@ -456,13 +505,19 @@ function nearestByX(pts, ev, svg, m, pw) {
 /* ════════════════════════════ price chart ═══════════════════════════════ */
 
 /* Only the CURRENT and NEXT window per asset. From the bot's own
-   exchange-aligned clock: 0 < secs_left <= 300 is the window running now,
-   300 < secs_left <= 600 is the one after; a closed window has 0 and drops
-   off the picker rather than lingering until it is reaped. */
+   exchange-aligned clock, against THAT market's own length: a market with
+   more than one window left is the one after; a closed window has 0 and drops
+   off the picker rather than lingering until it is reaped.
+
+   Measuring every market against a single 300 excluded 15m markets entirely
+   (753s left is not <= 600), which emptied the picker and left the page with
+   nothing selected and therefore no chart at all. */
+const isNextWindow = (m) => m.secs_left > windowOf(m);
+
 function pickerMarkets() {
   return (state.live.live_markets || [])
-    .filter((m) => m.secs_left > 0 && m.secs_left <= 2 * WINDOW_S)
-    .sort((a, b) => ((a.secs_left > WINDOW_S) - (b.secs_left > WINDOW_S))
+    .filter((m) => m.secs_left > 0 && m.secs_left <= 2 * windowOf(m))
+    .sort((a, b) => (isNextWindow(a) - isNextWindow(b))
                     || a.slug.localeCompare(b.slug));
 }
 
@@ -483,8 +538,8 @@ function renderPicker() {
   if (!state.selected) {
     const rank = (m) => {
       if (held.has(m.slug)) return [0, m.secs_left];
-      if (m.strike > 0 && m.secs_left <= WINDOW_S) return [1, m.secs_left];
-      if (m.secs_left <= WINDOW_S) return [2, m.secs_left];
+      if (m.strike > 0 && !isNextWindow(m)) return [1, m.secs_left];
+      if (!isNextWindow(m)) return [2, m.secs_left];
       return [3, m.secs_left];
     };
     setSelected(markets.slice().sort((a, b) => {
@@ -494,7 +549,7 @@ function renderPicker() {
   }
 
   // rebuilding eight buttons five times a second is pointless and eats clicks
-  const sig = JSON.stringify(markets.map((m) => [m.slug, m.secs_left > WINDOW_S, held.has(m.slug), (meta[m.slug] || 0) >= 2]))
+  const sig = JSON.stringify(markets.map((m) => [m.slug, isNextWindow(m), held.has(m.slug), (meta[m.slug] || 0) >= 2]))
     + '|' + state.selected;
   if (sig === pickerSig) return;
   pickerSig = sig;
@@ -506,7 +561,7 @@ function renderPicker() {
     b.className = 'chip';
     b.dataset.on = m.slug === state.selected ? '1' : '0';
     b.innerHTML = `${fmt.mkt(m.slug)}`
-      + (m.secs_left > WINDOW_S ? '<span class="pending">next</span>' : '')
+      + (isNextWindow(m) ? '<span class="pending">next</span>' : '')
       + (held.has(m.slug) ? '<span class="held">held</span>' : '');
     b.addEventListener('click', () => { setSelected(m.slug); pollLive(); });
     host.appendChild(b);
@@ -521,9 +576,9 @@ function fmtSpot(v) {
   return v.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
-function emptyChart(host, legendHost, forExport, hist) {
+function emptyChart(host, legendHost, forExport, hist, win = selectedWindowS()) {
   if (forExport) return null;
-  const opensIn = hist && hist.length ? Math.round(hist[hist.length - 1].left - WINDOW_S) : null;
+  const opensIn = hist && hist.length ? Math.round(hist[hist.length - 1].left - win) : null;
   host.innerHTML = `<p class="live-empty">${
     opensIn != null && opensIn > 0 ? `Window opens in ${opensIn}s.` : 'Collecting price samples…'}</p>`;
   legend(legendHost, []);
@@ -539,8 +594,11 @@ function renderSpotChart(slug = state.selected, host = $('#spot-chart'),
   const hist = (state.live.price_history || {})[slug];
   const rec = (state.live.closed_markets || []).find((x) => x.slug === slug)
     || (state.live.live_markets || []).find((x) => x.slug === slug);
-  const pts = (hist || []).filter((p) => p.spot != null && inWindow(p));
-  if (!pts.length) return emptyChart(host, $('#spot-legend'), forExport, hist);
+  // this market's own window, not the selected one: the export draws a CLOSED
+  // market offscreen while a different market is selected
+  const win = selectedWindowS(slug);
+  const pts = (hist || []).filter((p) => p.spot != null && inWindow(p, win));
+  if (!pts.length) return emptyChart(host, $('#spot-legend'), forExport, hist, win);
 
   const cSpot = css('--text-primary'), strike = rec && rec.strike ? rec.strike : null;
   const H = forExport ? 300 : 220, m = { t: 14, r: 64, b: 34, l: 64 };
@@ -563,7 +621,7 @@ function renderSpotChart(slug = state.selected, host = $('#spot-chart'),
     lab.textContent = fmtSpot(v);
     svg.appendChild(lab);
   }
-  const { X } = fixedAxis(svg, m, pw, H);
+  const { X } = fixedAxis(svg, m, pw, H, win);
 
   // the strike is a reference threshold, not data -- dashed on purpose, to
   // read as "target" rather than as a second series
@@ -592,7 +650,7 @@ function renderSpotChart(slug = state.selected, host = $('#spot-chart'),
   const hit = el('rect', { class: 'hit', x: m.l, y: m.t, width: pw, height: ph });
   svg.appendChild(hit);
   hit.addEventListener('mousemove', (ev) => {
-    const p = nearestByX(pts, ev, svg, m, pw);
+    const p = nearestByX(pts, ev, svg, m, pw, win);
     if (!p) return;
     cross.setAttribute('x1', X(p)); cross.setAttribute('x2', X(p)); cross.setAttribute('opacity', 1);
     const rows = [['Price', fmtSpot(p.spot), cSpot]];
@@ -633,7 +691,8 @@ function renderStrikeChart(slug = state.selected, host = $('#strike-chart'), for
   const rec = (state.live.closed_markets || []).find((x) => x.slug === slug)
     || (state.live.live_markets || []).find((x) => x.slug === slug);
   const strike = rec && rec.strike ? rec.strike : null;
-  const pts = (hist || []).filter((p) => p.spot != null && inWindow(p));
+  const win = selectedWindowS(slug);
+  const pts = (hist || []).filter((p) => p.spot != null && inWindow(p, win));
   if (!pts.length || !strike) {
     if (forExport) return null;
     host.innerHTML = `<p class="live-empty">${pts.length ? 'No strike yet for this window.' : 'Collecting price samples…'}</p>`;
@@ -664,7 +723,7 @@ function renderStrikeChart(slug = state.selected, host = $('#strike-chart'), for
     lab.textContent = `${v > 0 ? '+' : ''}${v}`;
     svg.appendChild(lab);
   }
-  const { X } = fixedAxis(svg, m, pw, H);
+  const { X } = fixedAxis(svg, m, pw, H, win);
 
   // the +-1 sigma envelope: what the settling average can still do
   if (sigma > 0) {
@@ -712,7 +771,7 @@ function renderStrikeChart(slug = state.selected, host = $('#strike-chart'), for
   const hit = el('rect', { class: 'hit', x: m.l, y: m.t, width: pw, height: ph });
   svg.appendChild(hit);
   hit.addEventListener('mousemove', (ev) => {
-    const p = nearestByX(pts, ev, svg, m, pw);
+    const p = nearestByX(pts, ev, svg, m, pw, win);
     if (!p) return;
     cross.setAttribute('x1', X(p)); cross.setAttribute('x2', X(p)); cross.setAttribute('opacity', 1);
     const v = bpsOf(p), sd = bandAt(p);
@@ -741,8 +800,11 @@ function renderStrikeChart(slug = state.selected, host = $('#strike-chart'), for
 function renderPriceChart(slug = state.selected, host = $('#price-chart'),
                           forExport = false) {
   const hist = (state.live.price_history || {})[slug];
-  const pts = (hist || []).filter(inWindow);
-  if (pts.length < 2) return emptyChart(host, $('#price-legend'), forExport, hist);
+  const win = selectedWindowS(slug);
+  // NOT .filter(inWindow): Array#filter passes (p, index, array), so the index
+  // would arrive as the window length
+  const pts = (hist || []).filter((p) => inWindow(p, win));
+  if (pts.length < 2) return emptyChart(host, $('#price-legend'), forExport, hist, win);
 
   const cUp = css('--series-1'), cDown = css('--series-2');
   const H = 300, m = { t: 14, r: 56, b: 34, l: 48 };
@@ -756,7 +818,7 @@ function renderPriceChart(slug = state.selected, host = $('#price-chart'),
     lab.textContent = t.toFixed(2);
     svg.appendChild(lab);
   });
-  const { X } = fixedAxis(svg, m, pw, H);
+  const { X } = fixedAxis(svg, m, pw, H, win);
 
   [['up', cUp], ['down', cDown]].forEach(([key, color]) => {
     const d = pts.map((p, i) => `${i ? 'L' : 'M'}${X(p)},${Y(p[key])}`).join(' ');
@@ -832,7 +894,7 @@ function renderPriceChart(slug = state.selected, host = $('#price-chart'),
   const hit = el('rect', { class: 'hit', x: m.l, y: m.t, width: pw, height: ph });
   svg.appendChild(hit);
   hit.addEventListener('mousemove', (ev) => {
-    const p = nearestByX(pts, ev, svg, m, pw);
+    const p = nearestByX(pts, ev, svg, m, pw, win);
     if (!p) return;
     cross.setAttribute('x1', X(p)); cross.setAttribute('x2', X(p)); cross.setAttribute('opacity', 1);
     const rows = [
@@ -860,7 +922,7 @@ function renderPriceChart(slug = state.selected, host = $('#price-chart'),
   if (forExport) return svg;
   const mk = (state.live.live_markets || []).find((x) => x.slug === slug);
   $('#chart-sub').textContent = mk
-    ? `${fmt.mkt(slug)} · strike ${mk.strike ? mk.strike.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '—'} · ${fmt.mmss(mk.secs_left)} left · ${mk.status || ''}`
+    ? `${fmt.mkt(slug)} · ${fmt.window(mk)} UTC · strike ${mk.strike ? mk.strike.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '—'} · ${fmt.mmss(mk.secs_left)} left · ${mk.status || ''}`
     : 'Where the price sits against the strike, what the market charges for each side, and the raw price path.';
   return svg;
 }
@@ -1126,13 +1188,14 @@ function renderMarkets() {
     || a.secs_left - b.secs_left || a.slug.localeCompare(b.slug));
   $('#markets-table').innerHTML = rows.length
     ? '<thead><tr><th scope="col">Market</th><th scope="col">Status</th><th scope="col">Strike</th>'
-      + '<th scope="col">Left</th><th scope="col">Model</th><th scope="col">Market</th>'
+      + '<th scope="col">Opens – closes (UTC)</th><th scope="col">Left</th><th scope="col">Model</th><th scope="col">Market</th>'
       + '<th scope="col">Net edge</th><th scope="col">Flow</th><th scope="col">Regime</th>'
       + '<th scope="col">Decision</th><th scope="col">Position</th></tr></thead><tbody>'
       + ordered.map((m) => { const dc = m.decision || {}; const best = bestSide(dc); const st = marketStatus(m); return `<tr>
           <td>${fmt.mkt(m.slug)}</td>
           <td><span class="status" data-status="${st.replace(' ', '-')}">${st}</span></td>
           <td>${m.strike ? m.strike.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '—'}</td>
+          <td class="dim">${fmt.window(m)}</td>
           <td>${fmt.mmss(m.secs_left)}</td>
           <td>${dc.p_used == null ? '—' : dc.p_used.toFixed(3)}</td>
           <td>${dc.p_market == null ? '—' : dc.p_market.toFixed(3)}</td>
@@ -2296,13 +2359,15 @@ async function openSaved(slug) {
 
 function renderSavedChart(doc) {
   const host = $('#saved-detail-chart');
-  const pts = (doc.points || []).filter(inWindow);
+  // a saved window is not the selected one; its length comes from its own slug
+  const win = (Number(doc.window_s) > 0) ? Number(doc.window_s) : windowForSlug(doc.slug);
+  const pts = (doc.points || []).filter((p) => inWindow(p, win));
   if (!pts.length) { host.innerHTML = '<p class="empty-hint">This window has no sample path.</p>'; return; }
 
   const H = 280, m = { t: 18, r: 54, b: 34, l: 52 };
   const { svg, w } = mount(host, H);
   const pw = w - m.l - m.r, ph = H - m.t - m.b;
-  const { X } = fixedAxis(svg, m, pw, H);
+  const { X } = fixedAxis(svg, m, pw, H, win);
   const Y = (v) => m.t + ph - v * ph;                   // probabilities: a fixed 0..1
   const up = css('--series-1'), down = css('--series-2');
 
@@ -2345,7 +2410,7 @@ function renderSavedChart(doc) {
   const overlay = el('rect', { class: 'hit', x: m.l, y: m.t, width: pw, height: ph });
   svg.appendChild(overlay);
   overlay.addEventListener('mousemove', (ev) => {
-    const p = nearestByX(pts, ev, svg, m, pw);
+    const p = nearestByX(pts, ev, svg, m, pw, win);
     if (!p) return;
     showTip(tipRows(fmt.mmss(p.left) + ' left', [
       ['Up', p.up == null ? '—' : fmt.cents(p.up), up],
