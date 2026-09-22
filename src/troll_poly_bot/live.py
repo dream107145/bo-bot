@@ -46,7 +46,9 @@ from pathlib import Path
 
 import websockets
 
+from . import earnings as earnings_log
 from .config import BotConfig
+from .control import ControlFile, apply_to, current_values
 from .execution.latency import HOME_BROADBAND, LatencyModel, LatencyProfile
 from .execution.paper import FeeModel, PaperExchange
 from .features.engine import FeatureEngine
@@ -404,6 +406,14 @@ class LiveBot:
             self.exchange.clock = self.clock.now
         self._base_spot_age = self.cfg.engine.max_spot_age_ms
         self._base_book_age = self.cfg.engine.max_book_age_ms
+        #: Tunables the dashboard may change while we run. ``control_scope``
+        #: keeps a paper bot and a real-money bot in one directory steerable
+        #: apart: each reads the shared "all" section plus its own.
+        self.controls = ControlFile()
+        self.control_scope = "live" if self.is_live else "paper"
+        self.control_applied: list[str] = []
+        self.control_errors: list[str] = []
+        self.control_at: float | None = None
         self.tracker = StrikeTracker(tolerance_ms=3000.0)
         self.markets: dict[str, LiveMarket] = {}
         self.token_index: dict[str, tuple[str, LiveMarket]] = {}
@@ -1069,7 +1079,7 @@ class LiveBot:
                      info.get("slug", "?"), info.get("side", ""), f.size, f.price, f.fee,
                      f.slippage, f.round_trip_ms)
             row = {
-                "ts": now, "event": "fill", **info,
+                "ts": now, "event": "fill", "action": "BUY", **info,
                 "price": f.price, "size": f.size, "fee": f.fee,
                 "slippage": f.slippage, "round_trip_ms": f.round_trip_ms,
                 "cost": round(f.price * f.size, 4),
@@ -1287,9 +1297,22 @@ class LiveBot:
 
     def _ledger_append(self, row: dict) -> None:
         """Record one event to disk and to the in-memory tail the dashboard reads."""
+        # Stamp who wrote it. A paper bot and a real-money bot run out of one
+        # directory here and share this file, and without the tag their trades
+        # read as one interleaved history.
+        row.setdefault("mode", self.mode_label)
+        row.setdefault("live", self.is_live)
         self._append_log(row)
         self.ledger.append(row)
         del self.ledger[:-200]
+        if row.get("event") == "settle":
+            # the run ledger is cleared on restart; the earnings record is not,
+            # and it is tagged so paper money never lands in a real-money total
+            earnings_log.append({
+                "ts": row.get("ts"), "pnl": row.get("pnl"), "slug": row.get("slug", ""),
+                "asset": row.get("asset", ""), "exited": bool(row.get("exited")),
+                "mode": self.mode_label, "live": self.is_live,
+            })
 
     def _reset_trade_log(self) -> None:
         """Start each run with an empty trade log.
@@ -1418,6 +1441,13 @@ class LiveBot:
                               if self.cfg.engine.stop_loss_enabled else 0.0),
                 "trade_window_s": [self.cfg.engine.trade_window_start_s, self.cfg.engine.trade_window_end_s],
             },
+            "controls": {
+                "scope": self.control_scope,
+                "values": current_values(self.cfg, self.exchange),
+                "applied": self.control_applied[-8:],
+                "applied_at": self.control_at,
+                "errors": self.control_errors[:8],
+            },
             "spot": {a: round(p, 6) for a, p in self.spot.items()},
             "spot_sources": {
                 a: (lambda v: None if v is None else {
@@ -1470,6 +1500,40 @@ class LiveBot:
             blob = json.dumps(snap, separators=(",", ":")).encode()
         tmp.write_bytes(blob)
         tmp.replace(self.state_path)
+
+    async def control_loop(self, every: float = 2.0) -> None:
+        """Re-read the dashboard's tunables whenever the file changes.
+
+        Polling a small file beats a socket here: the dashboard is not
+        necessarily our parent, either process may restart independently, and
+        a file that is a second stale costs nothing at a 5-minute cadence.
+        """
+        while not self._stop.is_set():
+            try:
+                if self.controls.changed():
+                    self._apply_controls()
+            except Exception as exc:                      # noqa: BLE001
+                log.warning("control file could not be applied: %s", exc)
+            await asyncio.sleep(every)
+
+    def _apply_controls(self) -> None:
+        values, errors = self.controls.merged(self.control_scope)
+        changed = apply_to(values, self.cfg, self.exchange)
+        # the staleness gates are auto-widened from measured feed latency with
+        # a floor; an operator setting them means setting that floor, or the
+        # next latency report would immediately overwrite the new value
+        if "engine.max_spot_age_ms" in values:
+            self._base_spot_age = values["engine.max_spot_age_ms"]
+        if "engine.max_book_age_ms" in values:
+            self._base_book_age = values["engine.max_book_age_ms"]
+        self.control_errors = errors
+        if changed:
+            self.control_applied = changed
+            self.control_at = time.time()
+            for line in changed:
+                log.warning("CONTROL  %s", line)
+        for problem in errors:
+            log.warning("control file: %s", problem)
 
     async def state_loop(self, every: float = 0.1) -> None:
         tmp = self.state_path.with_suffix(".tmp")
@@ -1536,6 +1600,7 @@ class LiveBot:
             asyncio.create_task(self.settle_loop()),
             asyncio.create_task(self.state_loop()),
             asyncio.create_task(self.report_loop()),
+            asyncio.create_task(self.control_loop()),
         ]
         if hasattr(self.exchange, "run"):
             tasks.append(asyncio.create_task(self.exchange.run(self._stop)))

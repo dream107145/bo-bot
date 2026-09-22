@@ -16,3 +16,5 @@ data/live_bot.log
 *.egg-info/
 data/research/
 data/KILL
+data/controls.json
+data/charts_index.json

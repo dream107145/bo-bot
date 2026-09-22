@@ -23,6 +23,7 @@
 'use strict';
 
 const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
 const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
 const WINDOW_S = 300;           // a market is five minutes; the axis is fixed to it
@@ -30,8 +31,20 @@ const WINDOW_S = 300;           // a market is five minutes; the axis is fixed t
 const state = {
   live: null,
   bot: null,
+  page: 'market',        // which tab is open; gates the per-tick work
   selected: null,        // slug shown in the price chart
   timer: null,
+  //: earnings card: which calendar period, and whose money. ?period= and
+  //  ?scope= make a particular view linkable, the same way ?chart= does.
+  earn: (() => {
+    const q = new URLSearchParams(location.search);
+    const period = q.get('period'), scope = q.get('scope');
+    return {
+      period: ['day', 'week', 'month'].includes(period) ? period : 'day',
+      scope: ['all', 'paper', 'live'].includes(scope) ? scope : 'all',
+      data: null,
+    };
+  })(),
   //: draw the strike distance on the token chart (as implied P(up)) instead
   //  of in its own panel. ?overlay=1|0 in the URL wins; else remembered.
   overlay: (() => {
@@ -57,6 +70,12 @@ const fmt = {
   ms: (v) => Math.round(v) + ' ms',
   cents: (v) => v.toFixed(3),
   clock: (ms) => new Date(ms).toLocaleTimeString(),
+  stamp: (ms) => new Date(ms).toLocaleString(undefined,
+    { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+  // holds here run from under a second to a whole window, so seconds stay
+  // seconds rather than becoming an unreadable 0:06
+  dur: (s) => (s < 60 ? `${s < 10 ? s.toFixed(1) : Math.round(s)}s`
+    : `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`),
   mkt: (slug) => (slug || '').replace('-updown-5m-', ' '),
   mmss: (s) => {
     const t = Math.max(0, Math.round(s));
@@ -67,8 +86,13 @@ const fmt = {
 /* ═════════════════════════════════ theme ═════════════════════════════════ */
 
 function initTheme() {
+  // ?theme=dark|light wins, the same way ?overlay= does. It makes both themes
+  // reachable without touching stored state, which is what a screenshot or a
+  // second window comparing the two needs.
+  const q = new URLSearchParams(location.search).get('theme');
   const stored = (() => { try { return localStorage.getItem('tpb-theme'); } catch { return null; } })();
-  if (stored === 'dark' || stored === 'light') document.documentElement.dataset.theme = stored;
+  const pick = (q === 'dark' || q === 'light') ? q : stored;
+  if (pick === 'dark' || pick === 'light') document.documentElement.dataset.theme = pick;
   themeLabel();
   $('#theme-toggle').addEventListener('click', () => {
     const cur = document.documentElement.dataset.theme
@@ -324,6 +348,7 @@ function renderAccount(a) {
 }
 
 async function pollAccount() {
+  if (state.page !== 'ledger') return;
   try {
     const a = await fetch('/api/account').then((r) => r.json()).catch(() => null);
     renderAccount(a);
@@ -1376,6 +1401,43 @@ function renderHistoryPager(h) {
   });
 }
 
+/* One position is several events. This is the same data read as trades:
+   when it was bought, when it was sold or settled, and what that cost and
+   returned. The raw stream is one toggle away for anyone who wants it. */
+function renderHistoryTrips(rows) {
+  const t = $('#history-table');
+  const head = '<thead><tr><th scope="col">Market</th><th scope="col">Side</th>'
+    + '<th scope="col">Shares</th><th scope="col">Bought</th><th scope="col">Closed</th>'
+    + '<th scope="col">Held</th><th scope="col">Result</th></tr></thead>';
+  if (!rows.length) {
+    t.innerHTML = head + '<tbody><tr><td colspan="7" class="dim">No trades yet.</td></tr></tbody>';
+    return;
+  }
+  t.innerHTML = head + '<tbody>' + rows.map((r) => {
+    const closedWord = r.status === 'open' ? 'still open'
+      : r.status === 'sold' ? 'sold' : 'settled';
+    const closedCell = r.closed_ts == null
+      ? '<span class="dim">still open</span>'
+      : `${fmt.clock(r.closed_ts)}<span class="sub">${closedWord}`
+        + `${r.exit_price == null ? '' : ` @ ${fmt.cents(r.exit_price)}`}</span>`;
+    const pnl = r.pnl;
+    const result = pnl == null
+      ? '<span class="dim">—</span>'
+      : `<span class="${pnl >= 0 ? 'pos' : 'neg'}">${fmt.signed(pnl)}</span>`
+        + `<span class="sub">fees ${fmt.money(r.fees || 0)}</span>`;
+    return `<tr>
+        <td>${fmt.mkt(r.slug)}${r.mode ? `<span class="sub">${r.mode}</span>` : ''}</td>
+        <td><span class="side-tag" data-side="${r.side || ''}">${r.side || '—'}</span></td>
+        <td>${fmt.num(r.shares, 2)}<span class="sub">${r.buys} fill${r.buys === 1 ? '' : 's'}</span></td>
+        <td>${r.bought_ts == null ? '—' : fmt.clock(r.bought_ts)}
+            <span class="sub">${r.entry_price == null ? '' : `@ ${fmt.cents(r.entry_price)}`}</span></td>
+        <td>${closedCell}</td>
+        <td>${r.hold_s == null ? '—' : fmt.dur(r.hold_s)}</td>
+        <td>${result}</td>
+      </tr>`;
+  }).join('') + '</tbody>';
+}
+
 function renderHistoryTable(rows) {
   // rows arrive as one page, newest first, straight from the server --
   // no client-side reversing or slicing left to do.
@@ -1384,10 +1446,16 @@ function renderHistoryTable(rows) {
     + '<th scope="col">Market</th><th scope="col">Detail</th><th scope="col">Result</th></tr></thead><tbody>'
     + rows.map((r) => {
       if (r.event === 'fill') {
-        return `<tr><td>${fmt.clock(r.ts)}</td><td>fill</td><td>${fmt.mkt(r.slug)}</td>`
+        // An entry and its exit are both "fill" rows for the same market and
+        // side, so without naming the direction they read as the same trade
+        // written twice. Older rows carry no action at all and are buys.
+        const sold = String(r.action || '').toUpperCase() === 'SELL';
+        return `<tr><td>${fmt.clock(r.ts)}</td>`
+          + `<td><span class="act ${sold ? 'act-sell' : 'act-buy'}">${sold ? 'sell' : 'buy'}</span></td>`
+          + `<td>${fmt.mkt(r.slug)}</td>`
           + `<td><span class="side-tag" data-side="${r.side || ''}">${r.side || '—'}</span> `
           + `${fmt.num(r.size, 1)} sh @ ${Number(r.price).toFixed(3)}</td>`
-          + `<td>cost ${fmt.money(r.cost ?? r.price * r.size)}</td></tr>`;
+          + `<td>${sold ? 'received' : 'cost'} ${fmt.money(Math.abs(r.cost ?? r.price * r.size))}</td></tr>`;
       }
       const pnl = Number(r.pnl || 0);
       // The venue outcome is authoritative. When Gamma had not published one
@@ -1396,16 +1464,34 @@ function renderHistoryTable(rows) {
       const venue = r.venue_up != null;
       const up = venue ? r.venue_up : r.ours_up;
       const who = up == null ? '' : (venue ? '' : ' (our TWAP)');
+      // A position closed early never waits for a direction, so naming a
+      // winner there would be inventing one. Say what actually happened.
+      const how = up != null ? `${up ? 'UP' : 'DOWN'} won${who}`
+        : r.exited ? 'closed before resolution'
+          : 'outcome not recorded';
       return `<tr><td>${fmt.clock(r.ts)}</td><td>settle</td><td>${fmt.mkt(r.slug)}</td>`
-        + `<td>${up == null ? '—' : (up ? 'UP' : 'DOWN')} won${who}</td>`
+        + `<td>${how}</td>`
         + `<td class="${pnl >= 0 ? 'pos' : 'neg'}">${fmt.signed(pnl)} · bal ${fmt.money(r.balance || 0)}</td></tr>`;
     }).join('') + '</tbody>';
 }
 
+/* ?view=events&money=live links the raw stream or one bot's half of it, the
+   same way ?period= and ?scope= link an earnings view. */
+const HIST = (() => {
+  const q = new URLSearchParams(location.search);
+  const view = q.get('view'), money = q.get('money');
+  return {
+    view: view === 'events' ? 'events' : 'trips',
+    mode: ['all', 'paper', 'live'].includes(money) ? money : 'all',
+  };
+})();
+
 async function pollHistory() {
+  if (state.page !== 'ledger') return;
   let h;
   try {
-    const qs = `?page=${historyPage}&page_size=${HISTORY_PAGE_SIZE}`;
+    const qs = `?page=${historyPage}&page_size=${HISTORY_PAGE_SIZE}`
+      + `&view=${HIST.view}&mode=${HIST.mode}`;
     h = await fetch(`/api/history${qs}`).then((r) => r.json());
   } catch { return; }
   const card = $('#history-card');
@@ -1415,18 +1501,60 @@ async function pollHistory() {
   // follow it so Prev/Next keep working off the page that actually exists
   historyPage = h.page || 1;
   const pnl = h.realised_pnl || 0;
+  const s = h.trips_summary || {};
+
+  // the money filter only earns its place once two kinds of bot have written
+  $('#history-mode-field').hidden = (h.modes || []).length < 2;
+
   $('#history-kpis').innerHTML = [
     { l: 'Realised PnL, all runs', v: fmt.signed(pnl), n: 'sum of every settlement on disk',
       cls: pnl >= 0 ? 'pos' : 'neg' },
-    { l: 'Settled', v: fmt.num(h.settled), n: `${h.wins}W / ${h.losses}L` },
-    { l: 'Fills', v: fmt.num(h.fills), n: 'across every restart' },
+    { l: 'Trades', v: fmt.num(s.trips || 0),
+      n: `${fmt.num(h.events_total || 0)} events folded${s.open ? ` · ${s.open} open` : ''}` },
+    { l: 'Won', v: s.win_rate == null ? '—' : fmt.pct(s.win_rate),
+      n: `${fmt.num(s.wins || 0)}W / ${fmt.num(s.losses || 0)}L` },
+    { l: 'Typical hold', v: s.median_hold_s == null ? '—' : fmt.dur(s.median_hold_s),
+      n: `${fmt.num(s.sold_early || 0)} sold early · ${fmt.num(s.held_to_resolution || 0)} held` },
+    { l: 'Fees paid', v: fmt.money(s.fees || 0), n: `${fmt.num(s.shares || 0, 2)} shares traded` },
   ].map((k) => `<div class="kpi"><span class="kpi-label">${k.l}</span>`
     + `<span class="kpi-value ${k.cls || ''}">${k.v}</span><span class="kpi-note">${k.n}</span></div>`).join('');
+
   renderHistoryChart(h.curve || []);
-  renderHistoryTable(h.rows || []);
+  if (h.view === 'events') renderHistoryTable(h.rows || []);
+  else renderHistoryTrips(h.rows || []);
   renderHistoryPager(h);
 }
 
+function historySub(view) {
+  return view === 'events'
+    ? 'Every fill and settlement exactly as the bot wrote it, newest first. '
+      + 'An entry and its exit are separate rows here.'
+    : 'One row per position, with when it was bought and when it was sold or settled. '
+      + 'A position is often entered in two fills and then exited, which is several '
+      + 'events for one trade — those are folded together here.';
+}
+
+function wireHistory() {
+  $$('#history-view .seg-btn').forEach((b) => b.classList.toggle('is-on', b.dataset.view === HIST.view));
+  $('#history-mode').value = HIST.mode;
+  $('#history-sub').textContent = historySub(HIST.view);
+  $('#history-view').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-view]');
+    if (!btn) return;
+    HIST.view = btn.dataset.view;
+    historyPage = 1;
+    $$('#history-view .seg-btn').forEach((b) => b.classList.toggle('is-on', b === btn));
+    $('#history-sub').textContent = historySub(HIST.view);
+    pollHistory();
+  });
+  $('#history-mode').addEventListener('change', (ev) => {
+    HIST.mode = ev.target.value;
+    historyPage = 1;
+    pollHistory();
+  });
+}
+
+wireHistory();
 pollHistory();
 setInterval(pollHistory, 5000);
 pollAccount();
@@ -1446,6 +1574,10 @@ function changed(key, sig) {
 
 function render(force = false) {
   if (!state.live) return;
+  // Every panel below lives on the market page. Redrawing it ten times a
+  // second while the operator is reading another tab costs the same CPU and
+  // shows nobody anything, so the work simply does not happen.
+  if (state.page !== 'market') return;
   const d = state.live;
 
   if (force) pickerSig = '';
@@ -1494,3 +1626,787 @@ connectLive();                                 // push transport
 // this costs one function call a tick until the socket is actually gone.
 state.timer = setInterval(pollLive, 250);      // chart cadence (fallback)
 state.botTimer = setInterval(pollBot, 3000);   // process status
+
+/* ══════════════════════════════════ earnings ══════════════════════════════
+   Realised PnL per calendar period, from the append-only earnings log.
+
+   Form: the job is polarity — did this day/week/month make money or lose it —
+   so it is a DIVERGING column chart on a zero baseline, not a line and not a
+   sequential ramp. Profit takes categorical slot 1 and loss slot 2 (the same
+   two hues UP and DOWN use elsewhere); the pair validates at CVD dE 24.7 in
+   light and 26.8 in dark, where green/red fails at 4.1 and is unreadable for
+   the most common colour blindness. The hue is bound to the SIGN, so a filter
+   that changes which periods are shown never repaints anything.
+
+   Cumulative PnL is deliberately NOT overlaid: it is the same unit but a much
+   larger magnitude, and sharing one axis would flatten every bar to nothing.
+   It rides in the tooltip and in the card below instead.
+   ========================================================================= */
+
+const EARN_SPAN_HINT = { day: 'last 30 days', week: 'last 26 weeks', month: 'last 12 months' };
+
+function earnAxisMoney(v) {
+  const a = Math.abs(v);
+  const sign = v < 0 ? '-' : '';
+  if (a >= 1000) {
+    return sign + '$' + (a / 1000).toFixed(a >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k';
+  }
+  const s = a >= 10 ? a.toFixed(0) : a.toFixed(2).replace(/\.?0+$/, '');
+  return sign + '$' + (s || '0');
+}
+
+/* Axis ticks land on round money — 0, $2.50, $5 — not on fractions of the
+   data range. It also puts a gridline exactly on zero whenever the range
+   crosses it, which is the one line a profit-and-loss chart is read against. */
+function niceTicks(lo, hi, target = 5) {
+  const span = (hi - lo) || 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(span / target)));
+  const norm = span / target / mag;
+  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+  const start = Math.floor(lo / step) * step;
+  const end = Math.ceil(hi / step) * step;
+  const ticks = [];
+  for (let v = start; v <= end + step * 1e-9; v += step) {
+    ticks.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  }
+  return { ticks, lo: start, hi: end === start ? start + step : end };
+}
+
+/* a column with its far end rounded and its baseline end square */
+function colPath(x, y, w, h, r, up) {
+  const rr = Math.max(0, Math.min(r, w / 2, h));
+  if (h <= 0.4) return `M${x},${y} h${w}`;              // a flat period still shows a tick
+  return up
+    ? `M${x},${y + h} V${y + rr} A${rr},${rr} 0 0 1 ${x + rr},${y}`
+      + ` H${x + w - rr} A${rr},${rr} 0 0 1 ${x + w},${y + rr} V${y + h} Z`
+    : `M${x},${y} H${x + w} V${y + h - rr} A${rr},${rr} 0 0 1 ${x + w - rr},${y + h}`
+      + ` H${x + rr} A${rr},${rr} 0 0 1 ${x},${y + h - rr} Z`;
+}
+
+async function loadEarnings() {
+  const { period, scope } = state.earn;
+  try {
+    const r = await fetch(`/api/earnings?period=${period}&scope=${scope}`);
+    state.earn.data = await r.json();
+  } catch {
+    return;                                    // keep the last good view
+  }
+  renderEarnings();
+}
+
+function renderEarnings() {
+  const d = state.earn.data;
+  if (!d) return;
+  const t = d.totals;
+
+  const periodWord = { day: 'day', week: 'week', month: 'month' }[d.period];
+  const kpis = [
+    { l: `Earned (${EARN_SPAN_HINT[d.period]})`, v: fmt.signed(t.pnl),
+      n: `${fmt.num(t.trades)} settled · ${t.periods_traded} ${periodWord}${t.periods_traded === 1 ? '' : 's'} traded` },
+    { l: `Best ${periodWord}`, v: d.best ? fmt.signed(d.best.pnl) : '—',
+      n: d.best ? d.best.label : 'nothing settled yet' },
+    { l: `Worst ${periodWord}`, v: d.worst ? fmt.signed(d.worst.pnl) : '—',
+      n: d.worst ? d.worst.label : 'nothing settled yet' },
+    { l: 'Win rate', v: t.win_rate == null ? '—' : fmt.pct(t.win_rate),
+      n: `${fmt.num(t.wins)}W / ${fmt.num(t.losses)}L` },
+    { l: 'Per settled window', v: t.per_trade == null ? '—' : fmt.signed(t.per_trade),
+      n: 'realised, after fees' },
+    { l: 'All time', v: fmt.signed(t.all_time_pnl),
+      n: `${fmt.num(t.all_time_trades)} windows on record` },
+  ];
+  $('#earnings-kpis').innerHTML = kpis.map((k) => `
+    <div class="kpi"><span class="kpi-label">${k.l}</span>
+    <span class="kpi-value">${k.v}</span><span class="kpi-note">${k.n}</span></div>`).join('');
+
+  const pos = css('--series-1'), neg = css('--series-2');
+  legend($('#earnings-legend'), [{ label: 'Profit', color: pos }, { label: 'Loss', color: neg }]);
+
+  renderEarningsChart(d, pos, neg);
+  renderEarningsTable(d);
+
+  const modes = (d.modes || []).join(', ');
+  const scopeWord = { all: 'paper and real money together',
+    paper: 'paper trading only', live: 'real money only' }[d.scope];
+  $('#earnings-note').textContent = t.all_time_trades
+    ? `Showing ${scopeWord}. Recorded from: ${modes || 'no runs yet'}. `
+      + 'Every settled window is written to data/earnings.jsonl, which no restart clears.'
+    : 'Nothing has settled yet. Each settled window appends one line to '
+      + 'data/earnings.jsonl, and this card reads that file — so it keeps counting across restarts.';
+}
+
+function renderEarningsChart(d, pos, neg) {
+  const host = $('#earnings-chart');
+  const buckets = d.buckets || [];
+  if (!buckets.length) { host.innerHTML = ''; return; }
+
+  const H = 260, m = { t: 22, r: 16, b: 38, l: 60 };
+  const { svg, w } = mount(host, H);
+  const pw = w - m.l - m.r, ph = H - m.t - m.b;
+
+  const vals = buckets.map((b) => b.pnl);
+  const rawHi = Math.max(0, ...vals), rawLo = Math.min(0, ...vals);
+  // headroom for the direct labels that sit above and below the extreme bars
+  const pad = ((rawHi - rawLo) || 2) * 0.12;
+  const scale = niceTicks(rawLo - pad, rawHi + pad);
+  const lo = scale.lo, hi = scale.hi;
+
+  const band = pw / buckets.length;
+  const barW = Math.min(24, Math.max(3, band - 2));     // the 2px surface gap
+  const X = (i) => m.l + i * band + (band - barW) / 2;
+  const Y = (v) => m.t + ph - ((v - lo) / (hi - lo)) * ph;
+  const zero = Y(0);
+
+  // gridlines: hairline, solid, recessive — they carry the values not labelled
+  scale.ticks.forEach((v) => {
+    const y = Y(v);
+    if (v !== 0) {
+      svg.appendChild(el('line', { class: 'grid-line', x1: m.l, x2: m.l + pw, y1: y, y2: y }));
+    }
+    const lab = el('text', { class: 'axis-text', x: m.l - 9, y: y + 4, 'text-anchor': 'end' });
+    lab.textContent = earnAxisMoney(v);
+    svg.appendChild(lab);
+  });
+  // the baseline is the one line that matters: above it the period earned
+  svg.appendChild(el('line', { class: 'axis-line', x1: m.l, x2: m.l + pw, y1: zero, y2: zero }));
+
+  // x labels, thinned so they cannot collide, and the newest period always shown
+  const every = Math.max(1, Math.ceil(buckets.length / 8));
+  buckets.forEach((b, i) => {
+    const last = i === buckets.length - 1;
+    if (!last && (i % every || i > buckets.length - 1 - every / 2)) return;
+    const lab = el('text', {
+      class: 'axis-text', x: X(i) + barW / 2, y: H - 14,
+      'text-anchor': last ? 'end' : 'middle',
+    });
+    lab.textContent = b.label;
+    svg.appendChild(lab);
+  });
+
+  const labelled = new Set([
+    d.best && d.best.key, d.worst && d.worst.key,
+    buckets[buckets.length - 1].trades ? buckets[buckets.length - 1].key : null,
+  ].filter(Boolean));
+
+  buckets.forEach((b, i) => {
+    const up = b.pnl >= 0;
+    const h = Math.abs(Y(b.pnl) - zero);
+    const y = up ? zero - h : zero;
+    const colour = up ? pos : neg;
+    if (b.trades) {
+      svg.appendChild(el('path', { d: colPath(X(i), y, barW, h, 4, up), fill: colour }));
+    }
+    // direct labels, sparingly: the extremes and the current period only
+    if (labelled.has(b.key) && b.trades) {
+      const lab = el('text', {
+        class: 'value-label-strong', x: X(i) + barW / 2,
+        y: up ? y - 7 : y + h + 15, 'text-anchor': 'middle',
+      });
+      lab.textContent = fmt.signed(b.pnl);
+      svg.appendChild(lab);
+    }
+    const hit = el('rect', { class: 'hit', x: m.l + i * band, y: m.t, width: band, height: ph });
+    svg.appendChild(hit);
+    hit.addEventListener('mousemove', (ev) => showTip(tipRows(b.label, [
+      ['Realised', fmt.signed(b.pnl), b.trades ? colour : null],
+      ['Running total', fmt.signed(b.cum)],
+      ['Windows settled', fmt.num(b.trades)],
+      ['Won / lost', `${b.wins} / ${b.losses}`],
+    ]), ev));
+    hit.addEventListener('mouseleave', hideTip);
+  });
+}
+
+function renderEarningsTable(d) {
+  const rows = (d.buckets || []).slice().reverse();
+  const head = '<thead><tr><th>Period</th><th>Realised</th>'
+    + '<th>Running total</th><th>Settled</th>'
+    + '<th>Won</th><th>Lost</th></tr></thead>';
+  const body = rows.map((b) => `<tr>
+      <td>${b.label}</td>
+      <td class="${b.pnl < 0 ? 'neg' : ''}">${b.trades ? fmt.signed(b.pnl) : '—'}</td>
+      <td>${fmt.signed(b.cum)}</td>
+      <td>${b.trades || '—'}</td>
+      <td>${b.wins || '—'}</td>
+      <td>${b.losses || '—'}</td>
+    </tr>`).join('');
+  $('#earnings-table').innerHTML = head + `<tbody>${body}</tbody>`;
+}
+
+function markSeg(sel, attr, value) {
+  $$(`${sel} .seg-btn`).forEach((b) => b.classList.toggle('is-on', b.dataset[attr] === value));
+}
+
+function wireEarnings() {
+  markSeg('#earn-period', 'period', state.earn.period);
+  markSeg('#earn-scope', 'scope', state.earn.scope);
+  $('#earn-period').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-period]');
+    if (!btn) return;
+    state.earn.period = btn.dataset.period;
+    markSeg('#earn-period', 'period', state.earn.period);
+    loadEarnings();
+  });
+  $('#earn-scope').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-scope]');
+    if (!btn) return;
+    state.earn.scope = btn.dataset.scope;
+    markSeg('#earn-scope', 'scope', state.earn.scope);
+    loadEarnings();
+  });
+}
+
+/* ══════════════════════════════ the tuning panel ══════════════════════════
+   Writes data/controls.json; a running bot re-reads it within ~2s and applies
+   the whitelisted values to the very objects the strategy is using.
+
+   A field left empty means "no override" — the bot keeps its own default, and
+   the placeholder shows what that currently is. That distinction matters: an
+   override equal to today's default is still an override, and would pin the
+   value if the default ever changed.
+
+   Nothing here can arm real money. Starting an armed bot stays a command-line
+   act, so a stray click on a local web page can never begin spending.
+   ========================================================================= */
+
+const CTRL = { spec: [], startArgs: {}, stored: {}, edits: {}, kill: false, loaded: false };
+
+const ctrlScope = () => $('#ctrl-scope').value;
+const ctrlStored = () => CTRL.stored[ctrlScope()] || {};
+const ctrlRunning = () => (state.live && state.live.controls && state.live.controls.values) || {};
+
+async function loadControls() {
+  try {
+    const r = await fetch('/api/controls');
+    const d = await r.json();
+    CTRL.spec = d.spec || [];
+    CTRL.startArgs = d.start_args || {};
+    CTRL.stored = d.stored || {};
+    CTRL.kill = !!d.kill_active;
+    CTRL.killFile = d.kill_file || 'data/KILL';
+    CTRL.loaded = true;
+  } catch {
+    return;
+  }
+  renderControls();
+}
+
+function ctrlShown(key) {
+  if (key in CTRL.edits) return CTRL.edits[key];
+  const stored = ctrlStored();
+  return key in stored ? stored[key] : null;       // null = no override
+}
+
+function ctrlFmt(row, v) {
+  if (v == null) return '—';
+  return row.kind === 'bool' ? (v ? 'on' : 'off') : String(v);
+}
+
+function renderControls() {
+  if (!CTRL.loaded) return;
+  const stored = ctrlStored();
+  const running = ctrlRunning();
+  const groups = [];
+  CTRL.spec.forEach((row) => {
+    let g = groups.find((x) => x.name === row.group);
+    if (!g) { g = { name: row.group, rows: [], liveOnly: true }; groups.push(g); }
+    g.rows.push(row);
+    if (row.applies_to !== 'live') g.liveOnly = false;
+  });
+
+  $('#ctrl-groups').innerHTML = groups.map((g, gi) => {
+    const n = g.rows.filter((r) => r.key in stored || r.key in CTRL.edits).length;
+    const fields = g.rows.map((row) => {
+      const shown = ctrlShown(row.key);
+      const dirty = row.key in CTRL.edits;
+      const live = running[row.key];
+      const runTxt = Object.keys(running).length
+        ? `Running: <b>${ctrlFmt(row, live == null ? null : live)}</b>`
+        : 'No bot running';
+      const input = row.kind === 'bool'
+        ? `<label class="ctrl-switch">
+             <input type="checkbox" data-key="${row.key}" data-kind="bool"
+                    ${shown === true ? 'checked' : ''}>
+             <span>${shown == null ? 'not overridden' : (shown ? 'on' : 'off')}</span>
+           </label>`
+        : `<input type="number" data-key="${row.key}" data-kind="${row.kind}"
+                  min="${row.lo}" max="${row.hi}" step="${row.step}"
+                  value="${shown == null ? '' : shown}"
+                  placeholder="${live == null ? 'default' : live}"
+                  aria-label="${row.label}">`;
+      return `<div class="ctrl-row${dirty ? ' is-dirty' : ''}" data-row="${row.key}">
+          <div class="ctrl-row-head">
+            <span class="ctrl-label">${row.label}</span>
+            ${row.unit ? `<span class="ctrl-unit">${row.unit}</span>` : ''}
+          </div>
+          ${input}
+          <span class="ctrl-running">${runTxt}</span>
+          <span class="ctrl-help">${row.help}</span>
+        </div>`;
+    }).join('');
+    return `<details class="ctrl-group"${gi === 0 ? ' open' : ''}${g.liveOnly ? ' data-live-only="1"' : ''}>
+        <summary>${g.name}${n ? `<span class="ctrl-count">${n} set</span>` : ''}</summary>
+        <div class="ctrl-grid">${fields}</div>
+      </details>`;
+  }).join('');
+
+  const dirty = Object.keys(CTRL.edits).length;
+  $('#ctrl-apply').disabled = !dirty;
+  $('#ctrl-revert').disabled = !dirty;
+  const killBtn = $('#ctrl-kill');
+  killBtn.setAttribute('aria-pressed', CTRL.kill ? 'true' : 'false');
+  killBtn.textContent = CTRL.kill ? 'Orders halted — resume' : 'Halt orders';
+
+  const c = (state.live && state.live.controls) || null;
+  const bits = [];
+  if (CTRL.kill) bits.push(`Every order is being refused while ${CTRL.killFile} exists.`);
+  if (c && c.applied_at) {
+    bits.push(`The ${c.scope} bot last applied: ${c.applied.join('; ')}`
+      + ` (${new Date(c.applied_at * 1000).toLocaleTimeString()}).`);
+  }
+  if (c && c.errors && c.errors.length) bits.push(`Bot reported: ${c.errors.join('; ')}`);
+  bits.push('Bankroll, assets and spot exchanges are start-time arguments: '
+    + 'change them in the header and press Restart.');
+  $('#ctrl-foot').textContent = bits.join(' ');
+}
+
+function ctrlStatus(msg, kind = 'ok') {
+  const s = $('#ctrl-status');
+  s.textContent = msg || '';
+  s.dataset.kind = kind;
+}
+
+function wireControls() {
+  $('#ctrl-groups').addEventListener('input', (ev) => {
+    const input = ev.target.closest('[data-key]');
+    if (!input) return;
+    const key = input.dataset.key;
+    if (input.dataset.kind === 'bool') {
+      CTRL.edits[key] = input.checked;
+    } else if (input.value === '') {
+      delete CTRL.edits[key];                    // emptied: drop the override
+    } else {
+      const n = Number(input.value);
+      if (Number.isFinite(n)) CTRL.edits[key] = n;
+    }
+    input.closest('.ctrl-row').classList.add('is-dirty');
+    $('#ctrl-apply').disabled = false;
+    $('#ctrl-revert').disabled = false;
+    ctrlStatus('');
+  });
+
+  $('#ctrl-scope').addEventListener('change', () => {
+    CTRL.edits = {};
+    ctrlStatus('');
+    renderControls();
+  });
+
+  $('#ctrl-revert').addEventListener('click', () => {
+    CTRL.edits = {};
+    ctrlStatus('');
+    renderControls();
+  });
+
+  $('#ctrl-apply').addEventListener('click', async () => {
+    const scope = ctrlScope();
+    const values = { ...CTRL.edits };
+    // an emptied field must be removed from the stored section, which the
+    // server does by rewriting the scope with what is left
+    const keep = { ...ctrlStored(), ...values };
+    Object.keys(ctrlStored()).forEach((k) => {
+      const input = $(`[data-key="${k}"]`);
+      if (input && input.dataset.kind !== 'bool' && input.value === '') delete keep[k];
+    });
+    $('#ctrl-apply').disabled = true;
+    try {
+      const res = await post('/api/controls', { scope, values: keep, replace: true });
+      CTRL.stored = res.stored || CTRL.stored;
+      CTRL.kill = !!res.kill_active;
+      CTRL.edits = {};
+      const warn = (res.warnings || []).join(' ');
+      const err = (res.errors || []).join(' ');
+      if (err) ctrlStatus(err, 'error');
+      else if (warn) ctrlStatus(`Saved, but check this: ${warn}`, 'warn');
+      else ctrlStatus(`Saved. A running bot picks this up within a couple of seconds.`, 'ok');
+      renderControls();
+    } catch (e) {
+      ctrlStatus('Could not reach the server: ' + e, 'error');
+      $('#ctrl-apply').disabled = false;
+    }
+  });
+
+  $('#ctrl-reset').addEventListener('click', async () => {
+    const scope = ctrlScope();
+    try {
+      const res = await post('/api/controls', { scope, reset: true });
+      CTRL.stored = res.stored || CTRL.stored;
+      CTRL.edits = {};
+      ctrlStatus('Overrides cleared. A bot already running keeps the values it '
+        + 'has until you restart it.', 'warn');
+      renderControls();
+    } catch (e) {
+      ctrlStatus('Could not reach the server: ' + e, 'error');
+    }
+  });
+
+  $('#ctrl-kill').addEventListener('click', async () => {
+    try {
+      const res = await post('/api/kill', { active: !CTRL.kill });
+      CTRL.kill = !!res.kill_active;
+      ctrlStatus(CTRL.kill
+        ? 'Halted. Every order is refused until you resume; positions already open are untouched.'
+        : 'Resumed. Orders can be sent again.', CTRL.kill ? 'warn' : 'ok');
+      renderControls();
+    } catch (e) {
+      ctrlStatus('Could not reach the server: ' + e, 'error');
+    }
+  });
+}
+
+/* The tuning panel shows each value the running bot is actually using. That
+   arrives with the 200ms state tick, but rebuilding the form that often would
+   steal focus mid-keystroke and wipe an unsaved edit, so only the running
+   figures are patched in place. */
+function refreshControlRunning() {
+  const running = ctrlRunning();
+  const any = Object.keys(running).length;
+  $$('.ctrl-row').forEach((rowEl) => {
+    const key = rowEl.dataset.row;
+    const span = rowEl.querySelector('.ctrl-running');
+    const input = rowEl.querySelector('input');
+    const v = running[key];
+    if (span) {
+      span.innerHTML = any
+        ? `Running: <b>${v == null ? '—' : (typeof v === 'boolean' ? (v ? 'on' : 'off') : v)}</b>`
+        : 'No bot running';
+    }
+    if (input && input.type === 'number' && v != null) input.placeholder = String(v);
+  });
+}
+
+wireEarnings();
+wireControls();
+loadEarnings();
+loadControls();
+// The earnings log only changes when a window settles, so a slow refresh is
+// plenty; the controls file changes when another tab or a hand edit writes it.
+setInterval(loadEarnings, 60000);
+setInterval(refreshControlRunning, 2000);
+
+/* ═══════════════════════════════ page router ══════════════════════════════
+   One document, five pages, switched on the hash. Everything stays on one
+   connection and one state file; what changes is which panels are in the DOM's
+   way and, more importantly, which work runs at all.
+
+   The market page redraws ten times a second. Leaving that running while you
+   read the ledger would burn the same CPU for nothing, so the per-tick render
+   and the two slow polls are gated on the page actually being open. Switching
+   to a page refreshes it immediately, so nothing is ever stale on arrival.
+   ========================================================================= */
+
+const PAGES = ['market', 'earnings', 'ledger', 'saved', 'variables'];
+
+function pageFromHash() {
+  const h = (location.hash || '').replace(/^#/, '').split('?')[0];
+  return PAGES.includes(h) ? h : 'market';
+}
+
+function showPage(name, { push = false } = {}) {
+  state.page = PAGES.includes(name) ? name : 'market';
+  $$('.page').forEach((p) => { p.hidden = p.dataset.page !== state.page; });
+  $$('.tab').forEach((a) => {
+    const on = a.dataset.page === state.page;
+    a.classList.toggle('is-on', on);
+    a.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  if (push && location.hash !== `#${state.page}`) location.hash = state.page;
+  try { localStorage.setItem('tpb-page', state.page); } catch { /* private mode */ }
+
+  // arriving at a page refreshes it rather than waiting for its next tick
+  if (state.page === 'market') render(true);
+  if (state.page === 'earnings') loadEarnings();
+  if (state.page === 'ledger') { pollHistory(); pollAccount(); }
+  if (state.page === 'saved') loadSaved();
+  if (state.page === 'variables') { loadControls(); refreshControlRunning(); }
+  // ?window=<slug> deep-links one archived window
+  const want = new URLSearchParams(location.search).get('window');
+  if (state.page === 'saved' && want && (!SAVED.open || SAVED.open.slug !== want)) openSaved(want);
+  scrollTo({ top: 0, behavior: 'instant' in document.documentElement.style ? 'instant' : 'auto' });
+}
+
+function wireRouter() {
+  addEventListener('hashchange', () => showPage(pageFromHash()));
+  const initial = location.hash
+    ? pageFromHash()
+    : (() => { try { return localStorage.getItem('tpb-page') || 'market'; } catch { return 'market'; } })();
+  showPage(initial);
+}
+
+/* ═════════════════════════════ saved markets ══════════════════════════════
+   The archive in data/charts: one JSON per closed window holding its whole
+   200ms sample path, plus the PNG the dashboard rendered at the time.
+
+   The list is served from a cached summary index, so paging through 876
+   windows never touches the 175 MB of sample points. The PNG is the thumbnail
+   because it already exists and costs nothing to show; opening a window
+   fetches that one JSON and redraws it live, which a picture cannot do.
+   ========================================================================= */
+
+const SAVED = { data: null, page: 1, open: null, busy: false };
+
+function savedQuery() {
+  const p = new URLSearchParams({
+    page: String(SAVED.page),
+    asset: $('#saved-asset').value,
+    outcome: $('#saved-outcome').value,
+    traded: $('#saved-traded').value,
+    sort: $('#saved-sort').value,
+    q: $('#saved-q').value.trim(),
+  });
+  return p.toString();
+}
+
+async function loadSaved(resetPage = false) {
+  if (resetPage) SAVED.page = 1;
+  if (SAVED.busy) return;
+  SAVED.busy = true;
+  try {
+    SAVED.data = await fetch(`/api/saved?${savedQuery()}`).then((r) => r.json());
+  } catch {
+    return;
+  } finally {
+    SAVED.busy = false;
+  }
+  renderSaved();
+}
+
+function renderSaved() {
+  const d = SAVED.data;
+  if (!d) return;
+  SAVED.page = d.page || 1;
+  const s = d.stats || {};
+
+  const count = $('#tab-saved-count');
+  if (count) count.textContent = fmt.num(s.windows || 0);
+
+  $('#saved-kpis').innerHTML = [
+    { l: 'Windows kept', v: fmt.num(s.windows || 0), n: `${(s.assets || []).length} assets` },
+    { l: 'We traded', v: fmt.num(s.traded || 0),
+      n: s.windows ? `${fmt.pct((s.traded || 0) / s.windows)} of them` : '—' },
+    { l: 'Realised on those', v: fmt.signed(s.pnl || 0),
+      n: s.win_rate == null ? 'nothing settled' : `${s.wins}W / ${s.losses}L` },
+    { l: 'Resolved Up', v: s.up_share == null ? '—' : fmt.pct(s.up_share),
+      n: 'of decided windows' },
+  ].map((k) => `<div class="kpi"><span class="kpi-label">${k.l}</span>`
+    + `<span class="kpi-value">${k.v}</span><span class="kpi-note">${k.n}</span></div>`).join('');
+
+  // the asset filter is built from what is actually on disk
+  const sel = $('#saved-asset');
+  const want = ['', ...(d.all_assets || [])];
+  if (sel.options.length !== want.length) {
+    const cur = sel.value;
+    sel.innerHTML = want.map((a) => `<option value="${a}">${a || 'All'}</option>`).join('');
+    sel.value = cur;
+  }
+
+  const rows = d.rows || [];
+  $('#saved-gallery').innerHTML = rows.length ? rows.map((r) => {
+    const outcome = r.outcome ? r.outcome.toUpperCase() : null;
+    const badge = outcome
+      ? `<span class="pill pill-${outcome === 'UP' ? 'up' : 'down'}">${outcome}</span>`
+      : '<span class="pill">unresolved</span>';
+    const pnl = r.traded
+      ? `<span class="${r.pnl >= 0 ? 'pos' : 'neg'}">${fmt.signed(r.pnl)}</span>`
+      : '<span class="dim">watched</span>';
+    const thumb = r.has_png
+      ? `<img loading="lazy" src="/charts/${r.slug}.png" alt="">`
+      : '<div class="thumb-none">no image</div>';
+    return `<button class="gcard" type="button" data-slug="${r.slug}">
+        <div class="gcard-thumb">${thumb}</div>
+        <div class="gcard-body">
+          <div class="gcard-top"><strong>${r.asset}</strong>${badge}</div>
+          <div class="gcard-when">${fmt.stamp(r.close_ts)}</div>
+          <div class="gcard-foot">
+            <span>${r.move_bps == null ? '—' : (r.move_bps >= 0 ? '+' : '') + fmt.num(r.move_bps, 0) + ' bps'}</span>
+            ${pnl}
+          </div>
+        </div>
+      </button>`;
+  }).join('') : '<p class="empty-hint">No saved window matches these filters.</p>';
+
+  const p = $('#saved-pager');
+  p.innerHTML = `<span class="pager-info">${fmt.num(d.total_rows)} windows · page ${d.page} of ${d.total_pages}</span>
+    <button class="btn btn-sm" type="button" id="saved-prev" ${d.page <= 1 ? 'disabled' : ''}>Previous</button>
+    <button class="btn btn-sm" type="button" id="saved-next" ${d.page >= d.total_pages ? 'disabled' : ''}>Next</button>`;
+  $('#saved-prev').onclick = () => { SAVED.page = Math.max(1, SAVED.page - 1); loadSaved(); };
+  $('#saved-next').onclick = () => { SAVED.page = SAVED.page + 1; loadSaved(); };
+}
+
+async function openSaved(slug) {
+  let doc;
+  try {
+    doc = await fetch(`/api/saved/${slug}`).then((r) => r.json());
+  } catch {
+    notice(`Could not read the saved window ${slug}`);
+    return;
+  }
+  if (!doc || doc.error) { notice(`No saved window called ${slug}`); return; }
+  SAVED.open = doc;
+  // make the open window linkable without reloading the page
+  try {
+    const u = new URL(location.href);
+    u.searchParams.set('window', slug);
+    history.replaceState(null, '', u);
+  } catch { /* older browsers: the view still works, the link just is not updated */ }
+  const card = $('#saved-detail');
+  card.hidden = false;
+
+  const outcome = (doc.outcome || '').toUpperCase();
+  $('#saved-detail-eyebrow').textContent = `${doc.asset || ''} · ${outcome || 'unresolved'}`
+    + (doc.outcome_source ? ` · graded by the ${doc.outcome_source}` : '');
+  $('#saved-detail-title').textContent = doc.question || fmt.mkt(doc.slug || slug);
+  $('#saved-detail-sub').textContent =
+    `${fmt.stamp(doc.open_ts)} → ${fmt.stamp(doc.close_ts)} · ${(doc.points || []).length} samples`;
+  $('#saved-detail-json').href = `/api/saved/${slug}`;
+  $('#saved-detail-json').setAttribute('download', `${slug}.json`);
+
+  const fills = doc.fills || [];
+  const shares = fills.reduce((a, f) => a + Math.abs(Number(f.size) || 0), 0);
+  const fees = fills.reduce((a, f) => a + (Number(f.fee) || 0), 0);
+  const pts = doc.points || [];
+  const lastSpot = [...pts].reverse().find((p) => typeof p.spot === 'number');
+  const move = (lastSpot && doc.strike) ? (lastSpot.spot - doc.strike) / doc.strike * 1e4 : null;
+  $('#saved-detail-kpis').innerHTML = [
+    { l: 'Strike', v: fmtSpot(doc.strike || 0), n: '60s TWAP at the open' },
+    { l: 'Closed at', v: lastSpot ? fmtSpot(lastSpot.spot) : '—',
+      n: move == null ? '' : `${move >= 0 ? '+' : ''}${fmt.num(move, 1)} bps from strike` },
+    { l: 'Our position', v: fills.length ? `${fmt.num(shares, 2)} sh` : 'none',
+      n: fills.length ? `${fills.length} fill${fills.length === 1 ? '' : 's'} · fees ${fmt.money(fees)}` : 'watched only' },
+    { l: 'Realised', v: fills.length ? fmt.signed(doc.pnl || 0) : '—',
+      n: fills.length ? 'after fees' : 'nothing at risk' },
+  ].map((k) => `<div class="kpi"><span class="kpi-label">${k.l}</span>`
+    + `<span class="kpi-value">${k.v}</span><span class="kpi-note">${k.n}</span></div>`).join('');
+
+  renderSavedChart(doc);
+  renderSavedFills(doc);
+  $('#saved-detail-foot').textContent =
+    `Fee schedule ${((doc.fee || {}).rate ?? 0) * 100}% · spot from ${(doc.exchanges || []).join(', ') || 'n/a'}`
+    + ` · saved as data/charts/${slug}.json`;
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderSavedChart(doc) {
+  const host = $('#saved-detail-chart');
+  const pts = (doc.points || []).filter(inWindow);
+  if (!pts.length) { host.innerHTML = '<p class="empty-hint">This window has no sample path.</p>'; return; }
+
+  const H = 280, m = { t: 18, r: 54, b: 34, l: 52 };
+  const { svg, w } = mount(host, H);
+  const pw = w - m.l - m.r, ph = H - m.t - m.b;
+  const { X } = fixedAxis(svg, m, pw, H);
+  const Y = (v) => m.t + ph - v * ph;                   // probabilities: a fixed 0..1
+  const up = css('--series-1'), down = css('--series-2');
+
+  for (let k = 0; k <= 4; k++) {
+    const v = k / 4, y = Y(v);
+    svg.appendChild(el('line', { class: 'grid-line', x1: m.l, x2: m.l + pw, y1: y, y2: y }));
+    const lab = el('text', { class: 'axis-text', x: m.l - 9, y: y + 4, 'text-anchor': 'end' });
+    lab.textContent = v.toFixed(2);
+    svg.appendChild(lab);
+  }
+
+  [['up', up, 'Up'], ['down', down, 'Down']].forEach(([key, colour]) => {
+    const d = pts.filter((p) => typeof p[key] === 'number')
+      .map((p, i) => `${i ? 'L' : 'M'}${X(p)},${Y(p[key])}`).join(' ');
+    if (d) svg.appendChild(el('path', { class: 'series-line', d, stroke: colour }));
+  });
+
+  (doc.fills || []).forEach((f) => {
+    const left = typeof f.left === 'number' ? f.left
+      : (doc.close_ts && f.ts ? (doc.close_ts - f.ts) / 1000 : null);
+    if (left == null) return;
+    const side = String(f.tag || f.side || '').toUpperCase().includes('DOWN') ? 'down' : 'up';
+    const price = Number(f.price);
+    if (!Number.isFinite(price)) return;
+    const cx = X({ left }), cy = Y(price);
+    svg.appendChild(el('circle', {
+      cx, cy, r: 5, fill: side === 'up' ? up : down,
+      stroke: css('--surface-1'), 'stroke-width': 2,
+    }));
+  });
+
+  legend($('#saved-detail-legend'), [
+    { label: 'Up', color: up }, { label: 'Down', color: down },
+  ]);
+
+  pts.forEach((p) => {
+    const hit = el('circle', { class: 'hit', cx: X(p), cy: m.t + ph / 2, r: 0 });
+    svg.appendChild(hit);
+  });
+  const overlay = el('rect', { class: 'hit', x: m.l, y: m.t, width: pw, height: ph });
+  svg.appendChild(overlay);
+  overlay.addEventListener('mousemove', (ev) => {
+    const p = nearestByX(pts, ev, svg, m, pw);
+    if (!p) return;
+    showTip(tipRows(fmt.mmss(p.left) + ' left', [
+      ['Up', p.up == null ? '—' : fmt.cents(p.up), up],
+      ['Down', p.down == null ? '—' : fmt.cents(p.down), down],
+      ['Spot', p.spot == null ? '—' : fmtSpot(p.spot)],
+    ]), ev);
+  });
+  overlay.addEventListener('mouseleave', hideTip);
+}
+
+function renderSavedFills(doc) {
+  const fills = doc.fills || [];
+  const host = $('#saved-detail-fills');
+  if (!fills.length) { host.innerHTML = ''; return; }
+  host.innerHTML = '<table class="data-table"><thead><tr><th>Side</th><th>Shares</th>'
+    + '<th>Price</th><th>Fee</th><th>Cost</th></tr></thead><tbody>'
+    + fills.map((f) => `<tr>
+        <td>${f.tag || f.side || '—'}</td>
+        <td>${fmt.num(Number(f.size) || 0, 2)}</td>
+        <td>${fmt.cents(Number(f.price) || 0)}</td>
+        <td>${fmt.money(Number(f.fee) || 0)}</td>
+        <td>${fmt.money((Number(f.price) || 0) * (Number(f.size) || 0))}</td>
+      </tr>`).join('') + '</tbody></table>';
+}
+
+function wireSaved() {
+  ['#saved-asset', '#saved-outcome', '#saved-traded', '#saved-sort'].forEach((sel) => {
+    $(sel).addEventListener('change', () => loadSaved(true));
+  });
+  let typing;
+  $('#saved-q').addEventListener('input', () => {
+    clearTimeout(typing);
+    typing = setTimeout(() => loadSaved(true), 250);
+  });
+  $('#saved-rescan').addEventListener('click', () => loadSaved());
+  $('#saved-gallery').addEventListener('click', (ev) => {
+    const card = ev.target.closest('[data-slug]');
+    if (card) openSaved(card.dataset.slug);
+  });
+  $('#saved-detail-close').addEventListener('click', () => {
+    $('#saved-detail').hidden = true;
+    SAVED.open = null;
+    try {
+      const u = new URL(location.href);
+      u.searchParams.delete('window');
+      history.replaceState(null, '', u);
+    } catch { /* nothing to undo */ }
+  });
+}
+
+/* The tab badge should say how many windows are kept before you have opened
+   the page. One row is enough to learn the total, and the index is cached, so
+   this costs a single cheap request on load. */
+async function loadSavedCount() {
+  try {
+    const d = await fetch('/api/saved?page_size=1').then((r) => r.json());
+    const el = $('#tab-saved-count');
+    if (el && d && d.stats) el.textContent = fmt.num(d.stats.windows || 0);
+  } catch { /* the badge simply stays empty */ }
+}
+
+wireSaved();
+wireRouter();
+if (state.page !== 'saved') setTimeout(loadSavedCount, 1200);

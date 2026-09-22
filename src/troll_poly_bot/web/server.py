@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .. import archive, control, earnings, ledger
 from ..execution.latency import PROFILES
 from ..feeds import account
 from ..sim import SimResult, run_sim
@@ -92,7 +93,8 @@ def _qs_int(qs: dict[str, list[str]], key: str, default: int) -> int:
         return default
 
 
-def _history(page: int = 1, page_size: int = DEFAULT_HISTORY_PAGE_SIZE) -> dict:
+def _history(page: int = 1, page_size: int = DEFAULT_HISTORY_PAGE_SIZE,
+             view: str = "trips", mode: str = "all") -> dict:
     """Every fill and settlement the live bot has ever written, across restarts.
 
     The dashboard state is per-process: a restart starts a fresh exchange at
@@ -104,18 +106,10 @@ def _history(page: int = 1, page_size: int = DEFAULT_HISTORY_PAGE_SIZE) -> dict:
     first, so the operator can page back through the whole history instead
     of only ever seeing the most recent slice of it.
     """
-    rows = []
-    try:
-        for line in TRADE_LOG.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    except OSError:
-        pass
+    rows = ledger.load(TRADE_LOG)
+    if mode in ("paper", "live"):
+        want_live = mode == "live"
+        rows = [r for r in rows if bool(r.get("live")) == want_live]
     settles = [r for r in rows if r.get("event") == "settle"]
     fills = [r for r in rows if r.get("event") == "fill"]
     realised, curve = 0.0, []
@@ -125,11 +119,18 @@ def _history(page: int = 1, page_size: int = DEFAULT_HISTORY_PAGE_SIZE) -> dict:
         curve.append({"ts": r.get("ts"), "slug": r.get("slug"),
                       "pnl": round(pnl, 4), "cum": round(realised, 4)})
 
+    # One position is several events -- often two partial entries, a sell and
+    # a settlement -- which in a flat list reads as the same trade repeated.
+    # The default view folds them into round trips, each with its own buy and
+    # sell time; the raw event stream stays available underneath.
+    trips = ledger.round_trips(rows)
+    view = view if view in ("trips", "events") else "trips"
+    listed = (trips[::-1] if view == "trips" else rows[::-1])   # newest first
+
     page_size = min(max(page_size, 1), MAX_HISTORY_PAGE_SIZE)
-    total_rows = len(rows)
+    total_rows = len(listed)
     total_pages = max(1, -(-total_rows // page_size))          # ceil div
     page = min(max(page, 1), total_pages)
-    newest_first = rows[::-1]
     start = (page - 1) * page_size
     return {
         "fills": len(fills),
@@ -138,12 +139,67 @@ def _history(page: int = 1, page_size: int = DEFAULT_HISTORY_PAGE_SIZE) -> dict:
         "losses": sum(1 for r in settles if float(r.get("pnl") or 0.0) <= 0),
         "realised_pnl": round(realised, 4),
         "curve": curve,
-        "rows": newest_first[start:start + page_size],
+        "view": view,
+        "mode": mode,
+        "modes": sorted({str(r.get("mode")) for r in ledger.load(TRADE_LOG) if r.get("mode")}),
+        "trips_summary": ledger.summary(trips),
+        "rows": listed[start:start + page_size],
+        "events_total": len(rows),
+        "trips_total": len(trips),
         "page": page,
         "page_size": page_size,
         "total_rows": total_rows,
         "total_pages": total_pages,
     }
+class _EarningsCache:
+    """Calendar-bucketed PnL, re-read only when the log actually grows.
+
+    The earnings log is append-only and never truncated, so it is the one file
+    here that grows without bound. Parsing it on every dashboard poll would be
+    wasteful; parsing it when its size or mtime changes is exact, because
+    appends always move both.
+    """
+
+    def __init__(self) -> None:
+        self._rows: list[earnings.Settlement] = []
+        self._stamp: tuple[float, int] | None = None
+        self._lock = threading.Lock()
+
+    def _fresh(self) -> list[earnings.Settlement]:
+        try:
+            st = earnings.EARNINGS_LOG.stat()
+            stamp = (st.st_mtime, st.st_size)
+        except OSError:
+            stamp = (0.0, 0)
+        with self._lock:
+            if stamp != self._stamp:
+                self._rows = earnings.load()
+                self._stamp = stamp
+            return self._rows
+
+    def get(self, period: str, scope: str, span: int | None) -> dict:
+        return earnings.aggregate(self._fresh(), period=period, scope=scope, span=span)
+
+
+EARNINGS = _EarningsCache()
+CONTROLS = control.ControlFile()
+ARCHIVE = archive.ArchiveIndex()
+
+
+def _controls_payload() -> dict:
+    """The catalogue, what is stored per scope, and the kill switch."""
+    stored = CONTROLS.read()
+    return {
+        "spec": control.spec(),
+        "start_args": control.START_ARGS,
+        "scopes": list(control.SCOPES),
+        "stored": {s: stored.get(s) or {} for s in control.SCOPES},
+        "updated_ts": stored.get("updated_ts"),
+        "kill_active": control.kill_active(),
+        "kill_file": str(control.KILL_PATH),
+    }
+
+
 CHART_DIR = Path("data/charts")
 #: A market slug, and nothing else — this value becomes a filename.
 SLUG_RE = re.compile(r"^[a-z0-9]+-updown-\d+m-\d+$")
@@ -299,11 +355,26 @@ class BotController:
     #: not own the handle. The UI says so rather than pretending.
     STALE_AFTER_S = 90.0
 
+    #: Start-time arguments this page may set. ``--live`` and ``--armed`` are
+    #: deliberately absent: arming real money stays a command-line act, so a
+    #: stray click on a web page can never start spending.
+    FLAGS: dict[str, tuple[str, str]] = {
+        "balance": ("--balance", "num"),
+        "assets": ("--assets", "text"),
+        "exchanges": ("--exchanges", "text"),
+        "min_edge": ("--min-edge", "num"),
+        "blend": ("--blend", "num"),
+        "take_profit": ("--take-profit", "num"),
+        "stop_loss": ("--stop-loss", "num"),
+    }
+
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.started_at: float | None = None
         self.last_error: str | None = None
-        self.args: dict[str, Any] = {"balance": 100.0, "assets": "BTC,ETH,SOL,XRP"}
+        self.args: dict[str, Any] = {"balance": 100.0, "assets": "",
+                                     "exchanges": "binance,bybit,coinbase",
+                                     "keep_history": False}
         self._lock = threading.Lock()
 
     def _external_alive(self) -> bool:
@@ -333,7 +404,39 @@ class BotController:
                 "error": self.last_error,
             }
 
-    def start(self, balance: float | None = None, assets: str | None = None) -> dict:
+    def _absorb(self, opts: dict[str, Any] | None) -> None:
+        """Keep only the flags we know, coerced. Anything else is ignored."""
+        for key, (_, kind) in self.FLAGS.items():
+            if opts is None or key not in opts:
+                continue
+            raw = opts[key]
+            if raw is None or (isinstance(raw, str) and not raw.strip() and kind == "num"):
+                self.args.pop(key, None)
+                continue
+            if kind == "num":
+                try:
+                    self.args[key] = float(raw)
+                except (TypeError, ValueError):
+                    continue
+            else:
+                self.args[key] = str(raw).strip()
+        if opts is not None and "keep_history" in opts:
+            self.args["keep_history"] = bool(opts["keep_history"])
+
+    def _command(self) -> list[str]:
+        cmd = [sys.executable, "-m", "troll_poly_bot"]
+        for key, (flag, _) in self.FLAGS.items():
+            value = self.args.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue           # an empty --assets means "every listed asset"
+            cmd += [flag, f"{value:g}" if isinstance(value, float) else str(value)]
+        if self.args.get("keep_history"):
+            cmd.append("--keep-history")
+        return cmd
+
+    def start(self, opts: dict[str, Any] | None = None) -> dict:
         with self._lock:
             if self.proc is not None and self.proc.poll() is None:
                 return {"ok": False, "reason": "already running"}
@@ -341,13 +444,8 @@ class BotController:
             return {"ok": False,
                     "reason": "a bot is already running that this server did not "
                               "start; stop it in its own terminal first"}
-        if balance is not None:
-            self.args["balance"] = float(balance)
-        if assets:
-            self.args["assets"] = assets
-        cmd = [sys.executable, "-m", "troll_poly_bot",
-               "--balance", str(self.args["balance"]),
-               "--assets", str(self.args["assets"])]
+        self._absorb(opts)
+        cmd = self._command()
         try:
             log_path = Path("data/live_bot.log")
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -392,10 +490,10 @@ class BotController:
         log.info("stopped live bot")
         return {"ok": True}
 
-    def restart(self, balance: float | None = None, assets: str | None = None) -> dict:
+    def restart(self, opts: dict[str, Any] | None = None) -> dict:
         self.stop()
         time.sleep(0.6)
-        return self.start(balance, assets)
+        return self.start(opts)
 
 
 BOT = BotController()
@@ -496,6 +594,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _raw(self, body: bytes, ctype: str, cache: str = "no-store") -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _chart_png(self, name: str) -> None:
+        """One archived window's rendered chart.
+
+        The slug is matched against the market-slug pattern rather than
+        sanitised, so no crafted name can reach outside the chart directory.
+        These files never change once written, so they may be cached.
+        """
+        slug = name[:-4] if name.endswith(".png") else name
+        target = ARCHIVE.png(slug)
+        if target is None:
+            self._json({"error": "not found"}, 404)
+            return
+        self._raw(target.read_bytes(), "image/png", cache="max-age=86400")
 
     def _static(self, rel: str) -> None:
         # resolve() + relative_to keeps a crafted path from escaping the dir
@@ -695,7 +815,9 @@ class Handler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             page = _qs_int(qs, "page", 1)
             page_size = _qs_int(qs, "page_size", DEFAULT_HISTORY_PAGE_SIZE)
-            self._json(_history(page, page_size))
+            self._json(_history(page, page_size,
+                                view=(qs.get("view") or ["trips"])[0],
+                                mode=(qs.get("mode") or ["all"])[0]))
         elif path == "/api/live":
             # Written by the live paper trader (python -m troll_poly_bot).
             # Served read-only so the dashboard can show it without the two
@@ -709,6 +831,35 @@ class Handler(BaseHTTPRequestHandler):
             # same builder the websocket uses, so the two transports cannot
             # drift apart in what they consider a payload
             self._json(self._live_payload(chart, since) or {"running": False})  # noqa: E501
+        elif path == "/api/earnings":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            period = (qs.get("period") or ["day"])[0]
+            scope = (qs.get("scope") or ["all"])[0]
+            span = _qs_int(qs, "span", 0) or None
+            self._json(EARNINGS.get(period, scope, span))
+        elif path == "/api/controls":
+            self._json(_controls_payload())
+        elif path == "/api/saved":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            one = lambda k: (qs.get(k) or [""])[0]            # noqa: E731
+            rows = archive.filter_rows(ARCHIVE.all_rows(), asset=one("asset"),
+                                       outcome=one("outcome"), traded=one("traded"),
+                                       search=one("q"))
+            out = archive.page(rows, _qs_int(qs, "page", 1),
+                               _qs_int(qs, "page_size", archive.DEFAULT_PAGE_SIZE),
+                               one("sort") or "recent")
+            out["stats"] = archive.stats(rows)
+            out["all_assets"] = archive.stats(ARCHIVE.all_rows())["assets"]
+            self._json(out)
+        elif path.startswith("/api/saved/"):
+            # the whole recorded window, sample path and all, for one market
+            src = ARCHIVE.one(urllib.parse.unquote(path[len("/api/saved/"):]))
+            if src is None:
+                self._json({"error": "unknown window"}, 404)
+            else:
+                self._raw(src.read_bytes(), "application/json")
+        elif path.startswith("/charts/"):
+            self._chart_png(urllib.parse.unquote(path[len("/charts/"):]))
         elif path.startswith("/api/job/"):
             job = MANAGER.get(path.rsplit("/", 1)[-1])
             self._json(job.snapshot() if job else {"error": "unknown job"},
@@ -728,13 +879,30 @@ class Handler(BaseHTTPRequestHandler):
             action = path.rsplit("/", 1)[-1]
             body = self._body()
             if action == "start":
-                self._json(BOT.start(body.get("balance"), body.get("assets")))
+                self._json(BOT.start(body))
             elif action == "stop":
                 self._json(BOT.stop())
             elif action == "restart":
-                self._json(BOT.restart(body.get("balance"), body.get("assets")))
+                self._json(BOT.restart(body))
             else:
                 self._json({"error": "unknown action"}, 404)
+        elif path == "/api/controls":
+            body = self._body()
+            scope = str(body.get("scope") or "all")
+            values = body.get("values") or {}
+            if body.get("reset"):
+                result = CONTROLS.clear_scope(scope)
+            elif body.get("replace"):
+                # the page sends the whole section, so clearing a field removes it
+                result = CONTROLS.replace_scope(scope, values)
+            else:
+                result = CONTROLS.write_scope(scope, values)
+            self._json({**result, **_controls_payload()},
+                       200 if result.get("ok") else 400)
+        elif path == "/api/kill":
+            body = self._body()
+            active = control.set_kill(bool(body.get("active")))
+            self._json({"ok": True, "kill_active": active})
         elif path == "/api/run":
             body = self._body()
             job = MANAGER.submit(

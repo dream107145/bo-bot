@@ -326,7 +326,105 @@ the **evidence** t-stat, today's PnL and drawdown, PnL by asset), token price
 chart with fill markers, **open markets with the engine decision on each**
 (model p, market p, net edge, regime, reason), model vs market with sources
 and regime, trades, the **reason-code bar chart** ("why it is not trading"),
-and the on-disk history across restarts.
+the on-disk history across restarts.
+
+### Five pages, one connection
+
+The console is split into tabs on the URL hash, so a link to `#ledger` or
+`#saved` opens there:
+
+| Page | What is on it |
+|---|---|
+| **Market** (`#market`) | equity and KPIs, the three window charts, open markets with the engine's decision, model vs market, why it is not trading, and the run's trades |
+| **Earnings** (`#earnings`) | realised PnL by calendar day, week or month |
+| **Ledger** (`#ledger`) | one row per position across all runs, with its buy and sell times, and the read-only venue account |
+| **Saved markets** (`#saved`) | the `data/charts` archive of closed windows |
+| **Bot variables** (`#variables`) | the tuning panel |
+
+This is not only tidier. The market page redraws ten times a second, and the
+ledger and account polls run on their own timers; all of that is now gated on
+the page actually being open, so reading the archive costs nothing in the
+trading view's CPU. Switching to a page refreshes it on arrival rather than
+waiting for its next tick.
+
+### Ledger: round trips, not events
+
+`data/live_trades.jsonl` is an event stream -- one line per fill, one per
+settlement. A single position routinely produces three or four of them,
+because a window is often entered in two partial fills, then sold, then
+settled. Listed flat, with no BUY/SELL marking, those lines look like the same
+trade written out several times. They never were duplicates; they were the
+parts of one round trip.
+
+So `ledger.py` folds them: one row per position carrying **when it was bought,
+when it was sold or settled**, the average price at each end, how long it was
+held, the fees and the result. A trip closes when the position goes flat, so
+buying the same window again after an exit starts a new one, and both sides of
+one window stay separate trades. The raw stream is one toggle away
+(`?view=events`), and there BUY and SELL are now named and coloured.
+
+Every ledger row is also stamped with the bot that wrote it. A paper bot and a
+real-money bot share this file when both run from one directory, and without
+the tag their trades read as one interleaved history; a Money filter appears
+once more than one kind has written.
+
+### Earnings (daily / weekly / monthly)
+
+Realised PnL bucketed into calendar days, weeks or months in the machine's own
+timezone, read from `data/earnings.jsonl`. That file is **append-only and never
+reset**: the run ledger (`data/live_trades.jsonl`) is cleared on a paper restart
+because the balance resets with it, which is right for the run view and useless
+for "what did I earn last month". Every settled window appends one line tagged
+with the mode that produced it, so **paper money and real money are counted
+separately and never summed** -- the All / Paper / Real toggle picks which.
+
+The chart is a diverging column chart on a zero baseline: the question is
+whether a period made money or lost it, which is polarity, not magnitude.
+Profit and loss wear the same two hues as UP and DOWN (blue and orange), which
+validate at CVD ΔE 24.7 light and 26.8 dark; the conventional green/red pair
+fails the same check at 4.1 and is unreadable for the commonest colour
+blindness. Periods with no trading are drawn as gaps rather than closed up,
+and a table view sits under the chart. `?period=week&scope=live` links a
+particular view.
+
+### Bot variables
+
+A tuning panel that writes `data/controls.json`; a running bot re-reads it
+within about two seconds and applies the values to the live config objects --
+no restart, and it works even for a bot this server did not start. Roughly
+thirty settings across edge, book filters, timing, exits, sizing, circuit
+breakers and the real-money caps. Every value is clamped to a range that
+cannot wedge the bot, unknown keys are reported rather than applied, and
+combinations that would make trading impossible (an order cap below the
+minimum order, a trade window that closes before it opens) come back as a
+warning on save.
+
+Because running a paper bot and a real-money bot out of one directory is
+normal here, the file is scoped: `all`, `paper` and `live`, with a bot applying
+`all` then its own section. The **Halt orders** button creates and removes
+`data/KILL`, which stops every order without touching open positions.
+
+Bankroll, assets and spot exchanges stay start-time arguments -- change them in
+the header and press Restart. Nothing on this page can arm real money:
+`--live --armed` remains a command-line act.
+
+### Saved markets
+
+`data/charts/` holds one JSON per closed window -- the whole 200 ms sample
+path, the strike, our fills and how the venue graded it -- next to the PNG the
+dashboard rendered at the time. That is ~175 MB after a few days, so the page
+never reads it to build a list: `archive.py` summarises each window once and
+caches the summary against the file's size and mtime in
+`data/charts_index.json`. A rescan then costs one `stat` per file and parses
+only genuinely new windows (1.8 s for the first 876, 0.02 s after). Delete the
+cache and the next listing rebuilds it.
+
+Filter by asset, outcome, or whether we actually traded it; sort by date, PnL
+or the size of the move. The PNG is the thumbnail because it already exists;
+opening a window fetches that one JSON and redraws it live, with the fills
+marked on the path, which a picture cannot do. `?window=<slug>` links a
+particular window. Slugs are matched against the market-slug pattern rather
+than sanitised, so no crafted name reaches outside the archive.
 
 The chart is **pushed, not polled**. The page opens a websocket to `/ws` and
 the server sends the state as the bot writes it -- measured 9.5 pushes/sec at

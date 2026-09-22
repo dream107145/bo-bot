@@ -556,3 +556,285 @@ p { margin: 0; }
 
 /* a few cells carry words, not numbers, and may wrap inside a half-width card */
 .data-table td.wrap { white-space: normal; max-width: 170px; line-height: 1.3; }
+
+/* ═════════════════ segmented toggles (period / scope pickers) ═════════════ */
+
+.seg {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+.seg-btn {
+  font: inherit; font-size: 12px; font-weight: 500;
+  padding: 5px 13px;
+  border: 0; border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background .13s ease, color .13s ease;
+}
+.seg-btn:hover { color: var(--text-primary); }
+.seg-btn.is-on {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(11, 11, 11, .08);
+}
+.seg-btn:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+
+.chart-top { display: flex; justify-content: flex-end; margin: 2px 0 6px; }
+
+/* a table view of every chart, folded away until asked for */
+.table-fold { margin-top: 14px; }
+.table-fold > summary {
+  cursor: pointer;
+  font-size: 12px; color: var(--text-secondary);
+  padding: 6px 0;
+  list-style: revert;
+}
+.table-fold > summary:hover { color: var(--text-primary); }
+.table-fold > summary:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+
+/* ════════════════════════════ the tuning panel ═══════════════════════════ */
+
+.ctrl-groups { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+
+.ctrl-group { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); }
+.ctrl-group > summary {
+  cursor: pointer;
+  padding: 11px 14px;
+  font-size: 13px; font-weight: 600; color: var(--text-primary);
+  display: flex; align-items: center; gap: 10px;
+}
+.ctrl-group > summary:focus-visible { outline: 2px solid var(--series-1); outline-offset: -2px; }
+.ctrl-group > summary .ctrl-count {
+  font-size: 11px; font-weight: 600; letter-spacing: .03em;
+  padding: 1px 7px; border-radius: 999px;
+  background: color-mix(in srgb, var(--series-1) 14%, transparent);
+  color: var(--text-secondary);
+}
+.ctrl-group[data-live-only="1"] > summary::after {
+  content: 'real money only';
+  margin-left: auto;
+  font-size: 11px; font-weight: 500; color: var(--text-muted);
+}
+
+.ctrl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(255px, 1fr));
+  gap: 12px 18px;
+  padding: 4px 14px 16px;
+}
+
+.ctrl-row { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.ctrl-row-head { display: flex; align-items: baseline; gap: 8px; justify-content: space-between; }
+.ctrl-row .ctrl-label { font-size: 12.5px; font-weight: 500; color: var(--text-primary); }
+.ctrl-row .ctrl-unit { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.ctrl-row input[type="number"] {
+  font: inherit; font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+.ctrl-row input[type="number"]:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+.ctrl-row.is-dirty input[type="number"],
+.ctrl-row.is-dirty .ctrl-switch { border-color: var(--series-1); }
+.ctrl-row .ctrl-help { font-size: 11px; line-height: 1.4; color: var(--text-muted); }
+.ctrl-row .ctrl-running { font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.ctrl-row .ctrl-running b { font-weight: 600; color: var(--text-primary); }
+
+.ctrl-switch {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  font-size: 12.5px; color: var(--text-secondary);
+  cursor: pointer;
+}
+.ctrl-switch input { accent-color: var(--series-1); }
+
+.ctrl-foot {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.ctrl-status { font-size: 12px; color: var(--text-secondary); }
+.ctrl-status[data-kind="error"] { color: var(--critical); }
+.ctrl-status[data-kind="warn"] { color: var(--text-primary); }
+.ctrl-status[data-kind="ok"] { color: var(--success-text); }
+
+.btn-danger { border-color: color-mix(in srgb, var(--critical) 45%, var(--border)); color: var(--critical); }
+.btn-danger:hover:not([disabled]) { background: color-mix(in srgb, var(--critical) 10%, var(--surface-1)); }
+.btn-danger[aria-pressed="true"] {
+  background: var(--critical); border-color: transparent; color: #fff;
+}
+
+#controls-card select {
+  font: inherit; font-size: 12px;
+  padding: 6px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+/* ════════════════════════════════ page tabs ══════════════════════════════ */
+
+.tabs {
+  position: sticky; top: 0; z-index: 30;
+  display: flex; gap: 2px; flex-wrap: wrap;
+  padding: 0 28px;
+  background: color-mix(in srgb, var(--page) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 13px 15px 12px;
+  font-size: 13px; font-weight: 500;
+  color: var(--text-secondary);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  transition: color .13s ease, border-color .13s ease;
+  white-space: nowrap;
+}
+.tab:hover { color: var(--text-primary); }
+.tab.is-on { color: var(--text-primary); font-weight: 600; border-bottom-color: var(--series-1); }
+.tab:focus-visible { outline: 2px solid var(--series-1); outline-offset: -3px; border-radius: 4px; }
+.tab-count {
+  font-size: 11px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px; border-radius: 999px;
+  background: var(--surface-2); color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.tab.is-on .tab-count { background: color-mix(in srgb, var(--series-1) 14%, transparent); }
+/* a count that has nothing to say should not draw an empty pill */
+.tab-count:empty { display: none; }
+
+.page[hidden] { display: none; }
+
+/* ══════════════════════════ saved-market gallery ═════════════════════════ */
+
+.filters {
+  display: flex; flex-wrap: wrap; gap: 10px 16px;
+  align-items: center;
+  padding: 14px 0 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 14px;
+}
+.filters select, .filters input[type="search"] {
+  font: inherit; font-size: 12.5px;
+  padding: 6px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+.filters input[type="search"] { width: 220px; }
+.filters select:focus-visible,
+.filters input:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+.gcard {
+  display: flex; flex-direction: column;
+  padding: 0; text-align: left;
+  font: inherit; color: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color .13s ease, transform .13s ease, box-shadow .13s ease;
+}
+.gcard:hover { border-color: var(--border-strong); transform: translateY(-2px); box-shadow: var(--shadow); }
+.gcard:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+.gcard-thumb {
+  aspect-ratio: 16 / 9;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+.gcard-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top left; display: block; }
+.thumb-none {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--text-muted);
+}
+.gcard-body { padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 5px; }
+.gcard-top { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.gcard-when { font-size: 11.5px; color: var(--text-muted); }
+.gcard-foot {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.pill {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+  padding: 2px 7px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.pill-up {
+  background: color-mix(in srgb, var(--series-1) 16%, transparent);
+  border-color: color-mix(in srgb, var(--series-1) 35%, transparent);
+  color: var(--text-primary);
+}
+.pill-down {
+  background: color-mix(in srgb, var(--series-2) 16%, transparent);
+  border-color: color-mix(in srgb, var(--series-2) 35%, transparent);
+  color: var(--text-primary);
+}
+
+@media (max-width: 760px) {
+  .tabs { padding: 0 14px; overflow-x: auto; flex-wrap: nowrap; }
+  .gallery { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .filters input[type="search"] { width: 100%; }
+}
+
+/* ═══════════════════════ round-trip ledger rows ══════════════════════════ */
+
+/* a quiet second line inside a table cell: the price under a time, the fee
+   under a result. It carries the detail without doubling the column count. */
+.data-table .sub {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.data-table td { vertical-align: top; }
+
+/* buy and sell are the two rows that used to look identical */
+.act {
+  display: inline-block;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase;
+  padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+}
+.act-buy {
+  background: color-mix(in srgb, var(--series-1) 16%, transparent);
+  border-color: color-mix(in srgb, var(--series-1) 35%, transparent);
+  color: var(--text-primary);
+}
+.act-sell {
+  background: color-mix(in srgb, var(--series-2) 16%, transparent);
+  border-color: color-mix(in srgb, var(--series-2) 35%, transparent);
+  color: var(--text-primary);
+}

@@ -44,10 +44,19 @@
   </div>
 </header>
 
+<nav class="tabs" id="tabs" role="tablist" aria-label="Sections">
+  <a class="tab" role="tab" href="#market"    data-page="market">Market</a>
+  <a class="tab" role="tab" href="#earnings"  data-page="earnings">Earnings</a>
+  <a class="tab" role="tab" href="#ledger"    data-page="ledger">Ledger</a>
+  <a class="tab" role="tab" href="#saved"     data-page="saved">Saved markets<span class="tab-count" id="tab-saved-count"></span></a>
+  <a class="tab" role="tab" href="#variables" data-page="variables">Bot variables<span class="tab-count" id="tab-vars-count"></span></a>
+</nav>
+
 <main class="content">
 
   <div id="notice" class="error-box" hidden role="alert"></div>
 
+  <section class="page" id="page-market" data-page="market">
   <div id="idle" class="empty-state">
     <h2>Bot is not running</h2>
     <p>
@@ -171,7 +180,50 @@
     </section>
 
   </div>
+  </section>
 
+  <section class="page" id="page-earnings" data-page="earnings" hidden>
+  <!-- Realised PnL bucketed by calendar period, from the append-only earnings
+       log. Survives every restart, unlike the per-run panels below. -->
+  <section class="card card-wide" id="earnings-card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">On disk &middot; never reset</p>
+        <h3>Earnings</h3>
+        <p class="card-sub" id="earnings-sub">
+          Realised profit and loss per calendar period, in this machine's timezone.
+          Paper and real money are recorded separately and never summed.
+        </p>
+      </div>
+      <div class="card-actions">
+        <div class="seg" id="earn-period" role="group" aria-label="Period">
+          <button class="seg-btn is-on" type="button" data-period="day">Daily</button>
+          <button class="seg-btn" type="button" data-period="week">Weekly</button>
+          <button class="seg-btn" type="button" data-period="month">Monthly</button>
+        </div>
+        <div class="seg" id="earn-scope" role="group" aria-label="Which money">
+          <button class="seg-btn is-on" type="button" data-scope="all">All</button>
+          <button class="seg-btn" type="button" data-scope="paper">Paper</button>
+          <button class="seg-btn" type="button" data-scope="live">Real</button>
+        </div>
+      </div>
+    </div>
+    <div class="kpi-row" id="earnings-kpis"></div>
+    <div class="chart-top">
+      <div class="legend" id="earnings-legend"></div>
+    </div>
+    <div class="chart-host" id="earnings-chart"></div>
+    <p class="card-foot" id="earnings-note"></p>
+    <details class="table-fold">
+      <summary>Table view</summary>
+      <div class="table-scroll">
+        <table class="data-table" id="earnings-table"></table>
+      </div>
+    </details>
+  </section>
+  </section>
+
+  <section class="page" id="page-ledger" data-page="ledger" hidden>
   <!-- The live panels above are per-process and reset on every restart.
        This is the append-only record on disk, shown whether or not a bot
        is running. -->
@@ -180,7 +232,25 @@
       <div>
         <p class="eyebrow">On disk</p>
         <h3>History across all runs</h3>
-        <p class="card-sub">Every fill and settlement the bot has ever written. The panels above reset on each restart; this does not.</p>
+        <p class="card-sub" id="history-sub">
+          One row per position, with when it was bought and when it was sold or settled.
+          A position is often entered in two fills and then exited, which is several
+          events for one trade &mdash; those are folded together here.
+        </p>
+      </div>
+      <div class="card-actions">
+        <div class="seg" id="history-view" role="group" aria-label="How to list the history">
+          <button class="seg-btn is-on" type="button" data-view="trips">Trades</button>
+          <button class="seg-btn" type="button" data-view="events">Raw events</button>
+        </div>
+        <label class="ctl-field" id="history-mode-field" hidden>
+          <span>Money</span>
+          <select id="history-mode">
+            <option value="all">All</option>
+            <option value="paper">Paper</option>
+            <option value="live">Real</option>
+          </select>
+        </label>
       </div>
     </div>
     <div class="kpi-row" id="history-kpis"></div>
@@ -208,6 +278,115 @@
       <table class="data-table" id="account-trades"></table>
     </div>
   </section>
+  </section>
+
+  <section class="page" id="page-saved" data-page="saved" hidden>
+  <!-- Every closed window the bot recorded, from data/charts. The per-run
+       panels reset; this archive is the durable research record. -->
+  <section class="card card-wide" id="saved-card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Archive &middot; data/charts</p>
+        <h3>Saved markets</h3>
+        <p class="card-sub">
+          Every closed window the bot kept: the full 200&thinsp;ms sample path, the strike,
+          our fills and how the venue resolved it. Summaries are cached, so only newly
+          saved windows have to be read.
+        </p>
+      </div>
+      <div class="card-actions">
+        <button id="saved-rescan" class="btn btn-ghost btn-sm" type="button">Rescan</button>
+      </div>
+    </div>
+
+    <div class="kpi-row" id="saved-kpis"></div>
+
+    <div class="filters" id="saved-filters">
+      <label class="ctl-field"><span>Asset</span>
+        <select id="saved-asset"><option value="">All</option></select></label>
+      <label class="ctl-field"><span>Outcome</span>
+        <select id="saved-outcome">
+          <option value="">Any</option><option value="UP">Up</option><option value="DOWN">Down</option>
+        </select></label>
+      <label class="ctl-field"><span>Traded</span>
+        <select id="saved-traded">
+          <option value="">Any</option><option value="yes">We traded</option><option value="no">Watched only</option>
+        </select></label>
+      <label class="ctl-field"><span>Sort</span>
+        <select id="saved-sort">
+          <option value="recent">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="best">Best PnL</option>
+          <option value="worst">Worst PnL</option>
+          <option value="move">Biggest move</option>
+        </select></label>
+      <label class="ctl-field ctl-wide"><span>Find</span>
+        <input id="saved-q" type="search" placeholder="slug or question" spellcheck="false"></label>
+    </div>
+
+    <div class="gallery" id="saved-gallery"></div>
+    <div class="pager" id="saved-pager"></div>
+  </section>
+
+  <section class="card card-wide" id="saved-detail" hidden aria-live="polite">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow" id="saved-detail-eyebrow">Window</p>
+        <h3 id="saved-detail-title">&mdash;</h3>
+        <p class="card-sub" id="saved-detail-sub"></p>
+      </div>
+      <div class="card-actions">
+        <a class="btn btn-ghost btn-sm" id="saved-detail-json" href="#" download>Download JSON</a>
+        <button class="btn btn-sm" id="saved-detail-close" type="button">Close</button>
+      </div>
+    </div>
+    <div class="kpi-row" id="saved-detail-kpis"></div>
+    <div class="legend" id="saved-detail-legend"></div>
+    <div class="chart-host" id="saved-detail-chart"></div>
+    <div class="table-scroll" id="saved-detail-fills"></div>
+    <p class="card-foot" id="saved-detail-foot"></p>
+  </section>
+  </section>
+
+  <section class="page" id="page-variables" data-page="variables" hidden>
+  <!-- Tuning. Written to data/controls.json; a running bot re-reads it within
+       ~2s. Nothing here can arm real money: that stays a command-line act. -->
+  <section class="card card-wide" id="controls-card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Tuning &middot; applies without a restart</p>
+        <h3>Bot variables</h3>
+        <p class="card-sub">
+          Changes reach a running bot within about two seconds. Values are clamped to
+          safe ranges, and anything the bot cannot apply is reported back rather than
+          silently dropped.
+        </p>
+      </div>
+      <div class="card-actions">
+        <label class="ctl-field">
+          <span>Applies to</span>
+          <select id="ctrl-scope">
+            <option value="all">Every bot</option>
+            <option value="paper">Paper bot only</option>
+            <option value="live">Real-money bot only</option>
+          </select>
+        </label>
+        <button id="ctrl-kill" class="btn btn-danger" type="button" aria-pressed="false">Halt orders</button>
+      </div>
+    </div>
+
+    <div id="ctrl-groups" class="ctrl-groups"></div>
+
+    <div class="ctrl-foot">
+      <button id="ctrl-apply" class="btn btn-primary" type="button" disabled>Apply changes</button>
+      <button id="ctrl-revert" class="btn" type="button" disabled>Discard edits</button>
+      <button id="ctrl-reset" class="btn btn-ghost" type="button">Clear overrides</button>
+      <span class="ctrl-status" id="ctrl-status"></span>
+    </div>
+    <p class="card-foot" id="ctrl-foot"></p>
+  </section>
+  </section>
+
 </main>
 
 <div id="tooltip" class="tooltip" hidden role="status" aria-live="polite"></div>

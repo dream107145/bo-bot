@@ -56,8 +56,20 @@ def test_ledger_append_writes_both_sides(tmp_path):
     """The tail the dashboard reads and the file the history panel reads."""
     bot = _bot(tmp_path)
     bot._ledger_append({"event": "fill", "slug": "btc-updown-5m-1"})
-    assert bot.ledger == [{"event": "fill", "slug": "btc-updown-5m-1"}]
+    assert bot.ledger == [{"event": "fill", "slug": "btc-updown-5m-1",
+                           "mode": bot.mode_label, "live": bot.is_live}]
     assert "btc-updown-5m-1" in bot.trade_log.read_text(encoding="utf-8")
+
+
+def test_every_row_says_which_bot_wrote_it(tmp_path):
+    """A paper bot and a real-money bot share this file; the tag tells them apart."""
+    bot = _bot(tmp_path)
+    bot._ledger_append({"event": "fill", "slug": "btc-updown-5m-1"})
+    row = bot.ledger[0]
+    assert row["mode"] == "live-paper" and row["live"] is False
+    # a row that already names its writer is left alone
+    bot._ledger_append({"event": "fill", "slug": "x", "mode": "LIVE-ARMED", "live": True})
+    assert bot.ledger[-1]["mode"] == "LIVE-ARMED" and bot.ledger[-1]["live"] is True
 
 
 def test_ledger_tail_is_bounded(tmp_path):
